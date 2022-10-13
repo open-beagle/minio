@@ -30,7 +30,6 @@ registry.cn-qingdao.aliyuncs.com/wod/golang:1.19 \
 bash .beagle/build.sh
 
 # check
-ldd .bin/linux/arm64/minio
 file .bin/linux/arm64/minio
 ```
 
