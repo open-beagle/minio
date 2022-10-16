@@ -7,7 +7,7 @@ git remote add upstream git@github.com:minio/minio.git
 
 git fetch upstream
 
-git merge RELEASE.2022-10-08T20-11-00Z
+git merge RELEASE.2022-10-15T19-57-03Z
 ```
 
 ## debug

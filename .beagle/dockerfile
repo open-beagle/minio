@@ -37,7 +37,7 @@ COPY .bin/${TARGETOS}/${TARGETARCH}/minio /usr/bin/minio
 
 RUN \
      apt update -y && \
-     apt install -y curl ca-certificates login passwd uidmap util-linux iproute2 iputils-arping iputils-clockdiff iputils-ping iputils-tracepath && \
+     apt install -y curl ca-certificates shadow-utils util-linux && \
      apt clean all && \
      chmod +x /usr/bin/minio && \
      chmod +x /usr/bin/docker-entrypoint.sh
