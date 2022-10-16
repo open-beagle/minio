@@ -35,7 +35,8 @@ ARG TARGETARCH
 
 COPY .bin/${TARGETOS}/${TARGETARCH}/minio /usr/bin/minio
 
-RUN apt update -y && \
+RUN export GNUTLS_CPUID_OVERRIDE=0x1 && \
+    apt update -y && \
     apt install -y curl ca-certificates uidmap util-linux && \
     apt clean all && \
     chmod +x /usr/bin/minio && \
