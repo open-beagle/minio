@@ -47,7 +47,7 @@ steps:
         path: /var/run/docker.sock
     settings:
       dockerfile: .beagle/dockerfile
-      base: registry.cn-qingdao.aliyuncs.com/wod/debian:bullseye-slim-amd64
+      base: registry.cn-qingdao.aliyuncs.com/wod/debian:bookworm-slim-amd64
       repo: wod/minio
       version: 2022-10-15
       channel: amd64
@@ -65,7 +65,7 @@ steps:
         path: /var/run/docker.sock
     settings:
       dockerfile: .beagle/dockerfile
-      base: registry.cn-qingdao.aliyuncs.com/wod/debian:bullseye-slim-arm64
+      base: registry.cn-qingdao.aliyuncs.com/wod/debian:bookworm-slim-arm64
       repo: wod/minio
       version: 2022-10-15
       channel: arm64
@@ -83,7 +83,7 @@ steps:
         path: /var/run/docker.sock
     settings:
       dockerfile: .beagle/dockerfile
-      base: registry.cn-qingdao.aliyuncs.com/wod/debian:bullseye-slim-ppc64le
+      base: registry.cn-qingdao.aliyuncs.com/wod/debian:bookworm-slim-ppc64le
       repo: wod/minio
       version: 2022-10-15
       channel: ppc64le
