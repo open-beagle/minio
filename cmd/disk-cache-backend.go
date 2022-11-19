@@ -953,7 +953,7 @@ func (c *diskCache) putRange(ctx context.Context, bucket, object string, data io
 		objSize, _ = sio.EncryptedSize(uint64(size))
 
 	}
-	cacheFile := MustGetUUID()
+	cacheFile := mustGetUUID()
 	n, _, err := c.bitrotWriteToCache(cachePath, cacheFile, reader, actualSize)
 	if IsErr(err, baseErrs...) {
 		// take the cache drive offline
@@ -1003,6 +1003,7 @@ func (c *diskCache) bitrotReadFromCache(ctx context.Context, filePath string, of
 	if err != nil {
 		return err
 	}
+	defer rc.Close()
 	bufp := c.pool.Get().(*[]byte)
 	defer c.pool.Put(bufp)
 

@@ -91,6 +91,34 @@ var ServerFlags = []cli.Flag{
 		EnvVar: "MINIO_READ_HEADER_TIMEOUT",
 		Hidden: true,
 	},
+	cli.DurationFlag{
+		Name:   "conn-read-deadline",
+		Usage:  "custom connection READ deadline",
+		Hidden: true,
+		Value:  10 * time.Minute,
+		EnvVar: "MINIO_CONN_READ_DEADLINE",
+	},
+	cli.DurationFlag{
+		Name:   "conn-write-deadline",
+		Usage:  "custom connection WRITE deadline",
+		Hidden: true,
+		Value:  10 * time.Minute,
+		EnvVar: "MINIO_CONN_WRITE_DEADLINE",
+	},
+}
+
+var gatewayCmd = cli.Command{
+	Name:            "gateway",
+	Usage:           "start object storage gateway",
+	Hidden:          true,
+	Flags:           append(ServerFlags, GlobalFlags...),
+	HideHelpCommand: true,
+	Action:          gatewayMain,
+}
+
+func gatewayMain(ctx *cli.Context) error {
+	logger.Fatal(errInvalidArgument, "Gateway is deprecated, To continue to use Gateway please use releases no later than 'RELEASE.2022-10-24T18-35-07Z'. We recommend all our users to migrate from gateway mode to server mode. Please read https://blog.min.io/deprecation-of-the-minio-gateway/")
+	return nil
 }
 
 var serverCmd = cli.Command{
@@ -235,6 +263,9 @@ func serverHandleCmdArgs(ctx *cli.Context) {
 		globalIsErasure = true
 	}
 	globalIsErasureSD = (setupType == ErasureSDSetupType)
+
+	globalConnReadDeadline = ctx.Duration("conn-read-deadline")
+	globalConnWriteDeadline = ctx.Duration("conn-write-deadline")
 }
 
 func serverHandleEnvVars() {
@@ -299,6 +330,8 @@ func initAllSubsystems(ctx context.Context) {
 
 	// Create new ILM tier configuration subsystem
 	globalTierConfigMgr = NewTierConfigMgr()
+
+	globalSiteResyncMetrics = newSiteResyncMetrics(GlobalContext)
 }
 
 func configRetriableErrors(err error) bool {
@@ -535,7 +568,7 @@ func serverMain(ctx *cli.Context) {
 
 	setHTTPServer(httpServer)
 
-	if globalIsDistErasure && globalEndpoints.FirstLocal() {
+	if globalIsDistErasure {
 		// Additionally in distributed setup, validate the setup and configuration.
 		if err := verifyServerSystemConfig(GlobalContext, globalEndpoints); err != nil {
 			logger.Fatal(err, "Unable to start the server")
@@ -549,6 +582,8 @@ func serverMain(ctx *cli.Context) {
 
 	xhttp.SetDeploymentID(globalDeploymentID)
 	xhttp.SetMinIOVersion(Version)
+
+	globalLeaderLock = newSharedLock(GlobalContext, newObject, "leader.lock")
 
 	// Enable background operations for erasure coding
 	initAutoHeal(GlobalContext, newObject)
@@ -657,7 +692,7 @@ func serverMain(ctx *cli.Context) {
 
 		// initialize the new disk cache objects.
 		if globalCacheConfig.Enabled {
-			logger.Info(color.Yellow("WARNING: Drive caching is deprecated for single/multi drive MinIO setups. Please migrate to using MinIO S3 gateway instead of drive caching"))
+			logger.Info(color.Yellow("WARNING: Drive caching is deprecated for single/multi drive MinIO setups."))
 			var cacheAPI CacheObjectLayer
 			cacheAPI, err = newServerCacheObjects(GlobalContext, globalCacheConfig)
 			logger.FatalIf(err, "Unable to initialize drive caching")
@@ -705,17 +740,5 @@ func serverMain(ctx *cli.Context) {
 
 // Initialize object layer with the supplied disks, objectLayer is nil upon any error.
 func newObjectLayer(ctx context.Context, endpointServerPools EndpointServerPools) (newObject ObjectLayer, err error) {
-	// For FS only, directly use the disk.
-	if endpointServerPools.NEndpoints() == 1 {
-		// Initialize new FS object layer.
-		newObject, err = NewFSObjectLayer(ctx, endpointServerPools[0].Endpoints[0].Path)
-		if err == nil {
-			return newObject, nil
-		}
-		if err != nil && err != errFreshDisk {
-			return newObject, err
-		}
-	}
-
 	return newErasureServerPools(ctx, endpointServerPools)
 }

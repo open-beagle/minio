@@ -317,7 +317,7 @@ func (p *poolMeta) validate(pools []*erasureSets) (bool, error) {
 	}
 
 	replaceScheme := func(k string) string {
-		// This is needed as fallback when users are changeing
+		// This is needed as fallback when users are updating
 		// from http->https or https->http, we need to verify
 		// both because MinIO remembers the command-line in
 		// "exact" order - as long as this order is not disturbed
@@ -359,7 +359,7 @@ func (p *poolMeta) validate(pools []*erasureSets) (bool, error) {
 			}
 		}
 		if !ok {
-			return false, fmt.Errorf("pool(%s) = %s is not specified, please specify on server command line", humanize.Ordinal(pi.position+1), k)
+			update = true
 		}
 	}
 
@@ -374,9 +374,9 @@ func (p *poolMeta) validate(pools []*erasureSets) (bool, error) {
 				}
 			}
 			if !ok {
-				return false, fmt.Errorf("pool(%s) = %s is not specified, please specify on server command line", humanize.Ordinal(pi.position+1), k)
+				update = true
 			}
-			if pos != pi.position {
+			if ok && pos != pi.position {
 				return false, fmt.Errorf("pool order change detected for %s, expected position is (%s) but found (%s)", k, humanize.Ordinal(pi.position+1), humanize.Ordinal(pos+1))
 			}
 		}
@@ -392,6 +392,7 @@ func (p *poolMeta) validate(pools []*erasureSets) (bool, error) {
 			}
 		}
 	}
+
 	return update, nil
 }
 
@@ -499,6 +500,15 @@ const (
 // Init() initializes pools and saves additional information about them
 // in 'pool.bin', this is eventually used for decommissioning the pool.
 func (z *erasureServerPools) Init(ctx context.Context) error {
+	// Load rebalance metadata if present
+	err := z.loadRebalanceMeta(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to load rebalance data: %w", err)
+	}
+
+	// Start rebalance routine
+	z.StartRebalance()
+
 	meta := poolMeta{}
 
 	if err := meta.load(ctx, z.serverPools[0], z.serverPools); err != nil {
@@ -571,6 +581,19 @@ func (z *erasureServerPools) Init(ctx context.Context) error {
 	}
 	z.poolMeta = meta
 	return nil
+}
+
+func (z *erasureServerPools) IsDecommissionRunning() bool {
+	z.poolMetaMutex.RLock()
+	defer z.poolMetaMutex.RUnlock()
+	meta := z.poolMeta
+	for _, pool := range meta.Pools {
+		if pool.Decommission != nil {
+			return true
+		}
+	}
+
+	return false
 }
 
 func (z *erasureServerPools) decommissionObject(ctx context.Context, bucket string, gr *GetObjectReader) (err error) {
@@ -1274,9 +1297,11 @@ func auditLogDecom(ctx context.Context, apiName, bucket, object, versionID strin
 	if err != nil {
 		errStr = err.Error()
 	}
-	auditLogInternal(ctx, bucket, object, AuditLogOptions{
+	auditLogInternal(ctx, AuditLogOptions{
 		Event:     "decommission",
 		APIName:   apiName,
+		Bucket:    bucket,
+		Object:    object,
 		VersionID: versionID,
 		Error:     errStr,
 	})

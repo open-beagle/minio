@@ -98,7 +98,8 @@ type WebhookTarget struct {
 	httpClient *http.Client
 	store      Store
 	loggerOnce logger.LogOnce
-	quitCh     chan struct{}
+	cancel     context.CancelFunc
+	cancelCh   <-chan struct{}
 }
 
 // ID - returns target ID.
@@ -112,6 +113,11 @@ func (target *WebhookTarget) IsActive() (bool, error) {
 		return false, err
 	}
 	return target.isActive()
+}
+
+// Store returns any underlying store if set.
+func (target *WebhookTarget) Store() event.TargetStore {
+	return target.store
 }
 
 func (target *WebhookTarget) isActive() (bool, error) {
@@ -178,7 +184,7 @@ func (target *WebhookTarget) send(eventData event.Event) error {
 		return err
 	}
 
-	req, err := http.NewRequest("POST", target.args.Endpoint.String(), bytes.NewReader(data))
+	req, err := http.NewRequest(http.MethodPost, target.args.Endpoint.String(), bytes.NewReader(data))
 	if err != nil {
 		return err
 	}
@@ -199,14 +205,12 @@ func (target *WebhookTarget) send(eventData event.Event) error {
 
 	resp, err := target.httpClient.Do(req)
 	if err != nil {
-		target.Close()
 		return err
 	}
 	defer resp.Body.Close()
 	io.Copy(io.Discard, resp.Body)
 
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
-		target.Close()
 		return fmt.Errorf("sending event failed with %v", resp.Status)
 	}
 
@@ -242,7 +246,7 @@ func (target *WebhookTarget) Send(eventKey string) error {
 
 // Close - does nothing and available for interface compatibility.
 func (target *WebhookTarget) Close() error {
-	close(target.quitCh)
+	target.cancel()
 	return nil
 }
 
@@ -273,29 +277,36 @@ func (target *WebhookTarget) initWebhook() error {
 		return errNotConnected
 	}
 
-	if target.store != nil {
-		streamEventsFromStore(target.store, target, target.quitCh, target.loggerOnce)
-	}
 	return nil
 }
 
 // NewWebhookTarget - creates new Webhook target.
 func NewWebhookTarget(ctx context.Context, id string, args WebhookArgs, loggerOnce logger.LogOnce, transport *http.Transport) (*WebhookTarget, error) {
+	ctx, cancel := context.WithCancel(ctx)
+
 	var store Store
 	if args.QueueDir != "" {
 		queueDir := filepath.Join(args.QueueDir, storePrefix+"-webhook-"+id)
 		store = NewQueueStore(queueDir, args.QueueLimit)
 		if err := store.Open(); err != nil {
+			cancel()
 			return nil, fmt.Errorf("unable to initialize the queue store of Webhook `%s`: %w", id, err)
 		}
 	}
 
-	return &WebhookTarget{
+	target := &WebhookTarget{
 		id:         event.TargetID{ID: id, Name: "webhook"},
 		args:       args,
 		loggerOnce: loggerOnce,
 		transport:  transport,
 		store:      store,
-		quitCh:     make(chan struct{}),
-	}, nil
+		cancel:     cancel,
+		cancelCh:   ctx.Done(),
+	}
+
+	if target.store != nil {
+		streamEventsFromStore(target.store, target, target.cancelCh, target.loggerOnce)
+	}
+
+	return target, nil
 }

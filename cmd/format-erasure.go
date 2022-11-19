@@ -177,7 +177,7 @@ func formatGetBackendErasureVersion(b []byte) (string, error) {
 		return "", fmt.Errorf(`format.Version expected: %s, got: %s`, formatMetaVersionV1, meta.Version)
 	}
 	if meta.Format != formatBackendErasure && meta.Format != formatBackendErasureSingle {
-		return "", fmt.Errorf(`found backend type %s, expected %s or %s`, meta.Format, formatBackendErasure, formatBackendErasureSingle)
+		return "", fmt.Errorf(`found backend type %s, expected %s or %s - to migrate to a supported backend visit https://min.io/docs/minio/linux/operations/install-deploy-manage/migrate-fs-gateway.html`, meta.Format, formatBackendErasure, formatBackendErasureSingle)
 	}
 	// Erasure backend found, proceed to detect version.
 	format := &formatErasureVersionDetect{}
@@ -666,30 +666,16 @@ func closeStorageDisks(storageDisks ...StorageAPI) {
 	wg.Wait()
 }
 
-func initStorageDisksWithErrorsWithoutHealthCheck(endpoints Endpoints) ([]StorageAPI, []error) {
-	// Bootstrap disks.
-	storageDisks := make([]StorageAPI, len(endpoints))
-	g := errgroup.WithNErrs(len(endpoints))
-	for index := range endpoints {
-		index := index
-		g.Go(func() (err error) {
-			storageDisks[index], err = newStorageAPIWithoutHealthCheck(endpoints[index])
-			return err
-		}, index)
-	}
-	return storageDisks, g.Wait()
-}
-
 // Initialize storage disks for each endpoint.
 // Errors are returned for each endpoint with matching index.
-func initStorageDisksWithErrors(endpoints Endpoints) ([]StorageAPI, []error) {
+func initStorageDisksWithErrors(endpoints Endpoints, healthCheck bool) ([]StorageAPI, []error) {
 	// Bootstrap disks.
 	storageDisks := make([]StorageAPI, len(endpoints))
 	g := errgroup.WithNErrs(len(endpoints))
 	for index := range endpoints {
 		index := index
 		g.Go(func() (err error) {
-			storageDisks[index], err = newStorageAPI(endpoints[index])
+			storageDisks[index], err = newStorageAPI(endpoints[index], healthCheck)
 			return err
 		}, index)
 	}

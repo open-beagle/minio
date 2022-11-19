@@ -31,6 +31,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/dustin/go-humanize"
 	"github.com/minio/madmin-go"
 	"github.com/minio/minio-go/v7/pkg/set"
 	"github.com/minio/minio-go/v7/pkg/tags"
@@ -42,11 +43,13 @@ import (
 )
 
 type erasureServerPools struct {
-	GatewayUnsupported
-
 	poolMetaMutex sync.RWMutex
 	poolMeta      poolMeta
-	serverPools   []*erasureSets
+
+	rebalMu   sync.RWMutex
+	rebalMeta *rebalanceMeta
+
+	serverPools []*erasureSets
 
 	// Shut down async operations
 	shutdown context.CancelFunc
@@ -61,22 +64,6 @@ func (z *erasureServerPools) SinglePool() bool {
 
 // Initialize new pool of erasure sets.
 func newErasureServerPools(ctx context.Context, endpointServerPools EndpointServerPools) (ObjectLayer, error) {
-	if endpointServerPools.NEndpoints() == 1 {
-		ep := endpointServerPools[0]
-		storageDisks, format, err := waitForFormatErasure(true, ep.Endpoints, 1, ep.SetCount, ep.DrivesPerSet, "", "")
-		if err != nil {
-			return nil, err
-		}
-
-		objLayer, err := newErasureSingle(ctx, storageDisks[0], format)
-		if err != nil {
-			return nil, err
-		}
-
-		globalLocalDrives = storageDisks
-		return objLayer, nil
-	}
-
 	var (
 		deploymentID       string
 		distributionAlgo   string
@@ -103,7 +90,7 @@ func newErasureServerPools(ctx context.Context, endpointServerPools EndpointServ
 		}
 
 		if err = storageclass.ValidateParity(commonParityDrives, ep.DrivesPerSet); err != nil {
-			return nil, fmt.Errorf("All current serverPools should have same parity ratio - expected %d, got %d", commonParityDrives, ecDrivesNoConfig(ep.DrivesPerSet))
+			return nil, fmt.Errorf("parity validation returned an error %w <- (%d, %d), for pool(%s)", err, commonParityDrives, ep.DrivesPerSet, humanize.Ordinal(i+1))
 		}
 
 		storageDisks[i], formats[i], err = waitForFormatErasure(local, ep.Endpoints, i+1,
@@ -129,7 +116,7 @@ func newErasureServerPools(ctx context.Context, endpointServerPools EndpointServ
 
 		// Validate if users brought different DeploymentID pools.
 		if deploymentID != formats[i].ID {
-			return nil, fmt.Errorf("All serverPools should have same deployment ID expected %s, got %s", deploymentID, formats[i].ID)
+			return nil, fmt.Errorf("all pools must have same deployment ID - expected %s, got %s for pool(%s)", deploymentID, formats[i].ID, humanize.Ordinal(i+1))
 		}
 
 		z.serverPools[i], err = newErasureSets(ctx, ep, storageDisks[i], formats[i], commonParityDrives, i)
@@ -329,8 +316,9 @@ func (z *erasureServerPools) getServerPoolsAvailableSpace(ctx context.Context, b
 	g := errgroup.WithNErrs(len(z.serverPools))
 	for index := range z.serverPools {
 		index := index
-		// skip suspended pools for any new I/O.
-		if z.IsSuspended(index) {
+		// Skip suspended pools or pools participating in rebalance for any new
+		// I/O.
+		if z.IsSuspended(index) || z.IsPoolRebalancing(index) {
 			continue
 		}
 		pool := z.serverPools[index]
@@ -428,6 +416,10 @@ func (z *erasureServerPools) getPoolInfoExistingWithOpts(ctx context.Context, bu
 		if z.IsSuspended(pinfo.Index) && opts.SkipDecommissioned {
 			continue
 		}
+		// Skip object if it's from pools participating in a rebalance operation.
+		if opts.SkipRebalancing && z.IsPoolRebalancing(pinfo.Index) {
+			continue
+		}
 
 		if pinfo.Err != nil && !isErrObjectNotFound(pinfo.Err) {
 			return pinfo, pinfo.Err
@@ -468,6 +460,7 @@ func (z *erasureServerPools) getPoolIdxExistingNoLock(ctx context.Context, bucke
 	return z.getPoolIdxExistingWithOpts(ctx, bucket, object, ObjectOptions{
 		NoLock:             true,
 		SkipDecommissioned: true,
+		SkipRebalancing:    true,
 	})
 }
 
@@ -491,7 +484,10 @@ func (z *erasureServerPools) getPoolIdxNoLock(ctx context.Context, bucket, objec
 // if none are found falls back to most available space pool, this function is
 // designed to be only used by PutObject, CopyObject (newObject creation) and NewMultipartUpload.
 func (z *erasureServerPools) getPoolIdx(ctx context.Context, bucket, object string, size int64) (idx int, err error) {
-	idx, err = z.getPoolIdxExistingWithOpts(ctx, bucket, object, ObjectOptions{SkipDecommissioned: true})
+	idx, err = z.getPoolIdxExistingWithOpts(ctx, bucket, object, ObjectOptions{
+		SkipDecommissioned: true,
+		SkipRebalancing:    true,
+	})
 	if err != nil && !isErrObjectNotFound(err) {
 		return idx, err
 	}
@@ -1389,9 +1385,10 @@ func (z *erasureServerPools) NewMultipartUpload(ctx context.Context, bucket, obj
 	}
 
 	for idx, pool := range z.serverPools {
-		if z.IsSuspended(idx) {
+		if z.IsSuspended(idx) || z.IsPoolRebalancing(idx) {
 			continue
 		}
+
 		result, err := pool.ListMultipartUploads(ctx, bucket, object, "", "", "", maxUploadsList)
 		if err != nil {
 			return nil, err
@@ -1669,7 +1666,7 @@ func (z *erasureServerPools) DeleteBucket(ctx context.Context, bucket string, op
 	}
 
 	// Purge the entire bucket metadata entirely.
-	z.renameAll(context.Background(), minioMetaBucket, pathJoin(bucketMetaPrefix, bucket))
+	z.deleteAll(context.Background(), minioMetaBucket, pathJoin(bucketMetaPrefix, bucket))
 	// If site replication is configured, hold on to deleted bucket state until sites sync
 	switch opts.SRDeleteOp {
 	case MarkDelete:
@@ -1679,15 +1676,15 @@ func (z *erasureServerPools) DeleteBucket(ctx context.Context, bucket string, op
 	return nil
 }
 
-// renameAll will rename bucket+prefix unconditionally across all disks to
+// deleteAll will rename bucket+prefix unconditionally across all disks to
 // minioMetaTmpDeletedBucket + unique uuid,
 // Note that set distribution is ignored so it should only be used in cases where
 // data is not distributed across sets. Errors are logged but individual
 // disk failures are not returned.
-func (z *erasureServerPools) renameAll(ctx context.Context, bucket, prefix string) {
+func (z *erasureServerPools) deleteAll(ctx context.Context, bucket, prefix string) {
 	for _, servers := range z.serverPools {
 		for _, set := range servers.sets {
-			set.renameAll(ctx, bucket, prefix)
+			set.deleteAll(ctx, bucket, prefix)
 		}
 	}
 }
@@ -2130,12 +2127,6 @@ func (z *erasureServerPools) HealObject(ctx context.Context, bucket, object, ver
 		Bucket: bucket,
 		Object: object,
 	}
-}
-
-// GetMetrics - returns metrics of local disks
-func (z *erasureServerPools) GetMetrics(ctx context.Context) (*BackendMetrics, error) {
-	logger.LogIf(ctx, NotImplemented{})
-	return &BackendMetrics{}, NotImplemented{}
 }
 
 func (z *erasureServerPools) getPoolAndSet(id string) (poolIdx, setIdx, diskIdx int, err error) {

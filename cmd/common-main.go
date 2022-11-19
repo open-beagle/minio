@@ -134,7 +134,7 @@ func init() {
 
 	globalForwarder = handlers.NewForwarder(&handlers.Forwarder{
 		PassHost:     true,
-		RoundTripper: newGatewayHTTPTransport(1 * time.Hour),
+		RoundTripper: newHTTPTransport(1 * time.Hour),
 		Logger: func(err error) {
 			if err != nil && !errors.Is(err, context.Canceled) {
 				logger.LogIf(GlobalContext, err)
@@ -151,7 +151,7 @@ func init() {
 	defaultAWSCredProvider = []credentials.Provider{
 		&credentials.IAM{
 			Client: &http.Client{
-				Transport: NewGatewayHTTPTransport(),
+				Transport: NewHTTPTransport(),
 			},
 		},
 	}
@@ -209,15 +209,8 @@ func minioConfigToConsoleFeatures() {
 	}
 	os.Setenv("CONSOLE_MINIO_REGION", globalSite.Region)
 	os.Setenv("CONSOLE_CERT_PASSWD", env.Get("MINIO_CERT_PASSWD", ""))
-	if globalSubnetConfig.License != "" {
-		os.Setenv("CONSOLE_SUBNET_LICENSE", globalSubnetConfig.License)
-	}
-	if globalSubnetConfig.APIKey != "" {
-		os.Setenv("CONSOLE_SUBNET_API_KEY", globalSubnetConfig.APIKey)
-	}
-	if globalSubnetConfig.ProxyURL != nil {
-		os.Setenv("CONSOLE_SUBNET_PROXY", globalSubnetConfig.ProxyURL.String())
-	}
+
+	globalSubnetConfig.ApplyEnv()
 }
 
 func buildOpenIDConsoleConfig() consoleoauth2.OpenIDPCfg {
@@ -306,22 +299,6 @@ func initConsoleServer() (*restapi.Server, error) {
 	}
 
 	return server, nil
-}
-
-func verifyObjectLayerFeatures(name string, objAPI ObjectLayer) {
-	if strings.HasPrefix(name, "gateway") {
-		if GlobalGatewaySSE.IsSet() && GlobalKMS == nil {
-			uiErr := config.ErrInvalidGWSSEEnvValue(nil).Msg("MINIO_GATEWAY_SSE set but KMS is not configured")
-			logger.Fatal(uiErr, "Unable to start gateway with SSE")
-		}
-	}
-
-	globalCompressConfigMu.Lock()
-	if globalCompressConfig.Enabled && !objAPI.IsCompressionSupported() {
-		logger.Fatal(errInvalidArgument,
-			"Compression support is requested but '%s' does not support compression", name)
-	}
-	globalCompressConfigMu.Unlock()
 }
 
 // Check for updates and print a notification message

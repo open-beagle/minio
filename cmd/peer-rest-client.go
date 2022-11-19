@@ -34,7 +34,7 @@ import (
 	"github.com/minio/minio/internal/http"
 	xhttp "github.com/minio/minio/internal/http"
 	"github.com/minio/minio/internal/logger"
-	"github.com/minio/minio/internal/pubsub"
+	"github.com/minio/minio/internal/logger/message/log"
 	"github.com/minio/minio/internal/rest"
 	xnet "github.com/minio/pkg/net"
 	"github.com/tinylib/msgp/msgp"
@@ -202,6 +202,8 @@ func (client *peerRESTClient) GetMetrics(ctx context.Context, t madmin.MetricTyp
 		values.Set(peerRESTDisk, disk)
 	}
 	values.Set(peerRESTJobID, opts.jobID)
+	values.Set(peerRESTDepID, opts.depID)
+
 	respBody, err := client.callWithContext(ctx, peerRESTMethodMetrics, values, nil, -1)
 	if err != nil {
 		return
@@ -551,6 +553,28 @@ func (client *peerRESTClient) ReloadPoolMeta(ctx context.Context) error {
 	return nil
 }
 
+func (client *peerRESTClient) StopRebalance(ctx context.Context) error {
+	respBody, err := client.callWithContext(ctx, peerRESTMethodStopRebalance, nil, nil, 0)
+	if err != nil {
+		logger.LogIf(ctx, err)
+		return err
+	}
+	defer http.DrainBody(respBody)
+	return nil
+}
+
+func (client *peerRESTClient) LoadRebalanceMeta(ctx context.Context, startRebalance bool) error {
+	values := url.Values{}
+	values.Set(peerRESTStartRebalance, strconv.FormatBool(startRebalance))
+	respBody, err := client.callWithContext(ctx, peerRESTMethodLoadRebalanceMeta, values, nil, 0)
+	if err != nil {
+		logger.LogIf(ctx, err)
+		return err
+	}
+	defer http.DrainBody(respBody)
+	return nil
+}
+
 func (client *peerRESTClient) LoadTransitionTierConfig(ctx context.Context) error {
 	respBody, err := client.callWithContext(ctx, peerRESTMethodLoadTransitionTierConfig, nil, nil, 0)
 	if err != nil {
@@ -561,7 +585,7 @@ func (client *peerRESTClient) LoadTransitionTierConfig(ctx context.Context) erro
 	return nil
 }
 
-func (client *peerRESTClient) doTrace(traceCh chan<- pubsub.Maskable, doneCh <-chan struct{}, traceOpts madmin.ServiceTraceOpts) {
+func (client *peerRESTClient) doTrace(traceCh chan<- madmin.TraceInfo, doneCh <-chan struct{}, traceOpts madmin.ServiceTraceOpts) {
 	values := make(url.Values)
 	traceOpts.AddParams(values)
 
@@ -602,7 +626,7 @@ func (client *peerRESTClient) doTrace(traceCh chan<- pubsub.Maskable, doneCh <-c
 	}
 }
 
-func (client *peerRESTClient) doListen(listenCh chan<- pubsub.Maskable, doneCh <-chan struct{}, v url.Values) {
+func (client *peerRESTClient) doListen(listenCh chan<- event.Event, doneCh <-chan struct{}, v url.Values) {
 	// To cancel the REST request in case doneCh gets closed.
 	ctx, cancel := context.WithCancel(GlobalContext)
 
@@ -641,7 +665,7 @@ func (client *peerRESTClient) doListen(listenCh chan<- pubsub.Maskable, doneCh <
 }
 
 // Listen - listen on peers.
-func (client *peerRESTClient) Listen(listenCh chan<- pubsub.Maskable, doneCh <-chan struct{}, v url.Values) {
+func (client *peerRESTClient) Listen(listenCh chan<- event.Event, doneCh <-chan struct{}, v url.Values) {
 	go func() {
 		for {
 			client.doListen(listenCh, doneCh, v)
@@ -657,7 +681,7 @@ func (client *peerRESTClient) Listen(listenCh chan<- pubsub.Maskable, doneCh <-c
 }
 
 // Trace - send http trace request to peer nodes
-func (client *peerRESTClient) Trace(traceCh chan<- pubsub.Maskable, doneCh <-chan struct{}, traceOpts madmin.ServiceTraceOpts) {
+func (client *peerRESTClient) Trace(traceCh chan<- madmin.TraceInfo, doneCh <-chan struct{}, traceOpts madmin.ServiceTraceOpts) {
 	go func() {
 		for {
 			client.doTrace(traceCh, doneCh, traceOpts)
@@ -672,7 +696,7 @@ func (client *peerRESTClient) Trace(traceCh chan<- pubsub.Maskable, doneCh <-cha
 	}()
 }
 
-func (client *peerRESTClient) doConsoleLog(logCh chan pubsub.Maskable, doneCh <-chan struct{}) {
+func (client *peerRESTClient) doConsoleLog(logCh chan log.Info, doneCh <-chan struct{}) {
 	// To cancel the REST request in case doneCh gets closed.
 	ctx, cancel := context.WithCancel(GlobalContext)
 
@@ -695,22 +719,20 @@ func (client *peerRESTClient) doConsoleLog(logCh chan pubsub.Maskable, doneCh <-
 
 	dec := gob.NewDecoder(respBody)
 	for {
-		var lg madmin.LogInfo
+		var lg log.Info
 		if err = dec.Decode(&lg); err != nil {
 			break
 		}
-		if lg.DeploymentID != "" {
-			select {
-			case logCh <- lg:
-			default:
-				// Do not block on slow receivers.
-			}
+		select {
+		case logCh <- lg:
+		default:
+			// Do not block on slow receivers.
 		}
 	}
 }
 
 // ConsoleLog - sends request to peer nodes to get console logs
-func (client *peerRESTClient) ConsoleLog(logCh chan pubsub.Maskable, doneCh <-chan struct{}) {
+func (client *peerRESTClient) ConsoleLog(logCh chan log.Info, doneCh <-chan struct{}) {
 	go func() {
 		for {
 			client.doConsoleLog(logCh, doneCh)

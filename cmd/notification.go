@@ -315,12 +315,12 @@ func (sys *NotificationSys) DownloadProfilingData(ctx context.Context, writer io
 	// Send profiling data to zip as file
 	for typ, data := range data {
 		err := embedFileInZip(zipWriter, fmt.Sprintf("profile-%s-%s", thisAddr, typ), data)
-		if err != nil {
-			logger.LogIf(ctx, err)
-		}
+		logger.LogIf(ctx, err)
+	}
+	if b := getClusterMetaInfo(ctx); len(b) > 0 {
+		logger.LogIf(ctx, embedFileInZip(zipWriter, "cluster.info", b))
 	}
 
-	appendClusterMetaInfoToZip(ctx, zipWriter)
 	return
 }
 
@@ -491,10 +491,6 @@ func (sys *NotificationSys) GetLocks(ctx context.Context, r *http.Request) []*Pe
 
 // LoadBucketMetadata - calls LoadBucketMetadata call on all peers
 func (sys *NotificationSys) LoadBucketMetadata(ctx context.Context, bucketName string) {
-	if globalIsGateway {
-		return
-	}
-
 	ng := WithNPeers(len(sys.peerClients))
 	for idx, client := range sys.peerClients {
 		if client == nil {
@@ -624,6 +620,49 @@ func (sys *NotificationSys) ReloadPoolMeta(ctx context.Context) {
 		client := client
 		ng.Go(ctx, func() error {
 			return client.ReloadPoolMeta(ctx)
+		}, idx, *client.host)
+	}
+	for _, nErr := range ng.Wait() {
+		reqInfo := (&logger.ReqInfo{}).AppendTags("peerAddress", nErr.Host.String())
+		if nErr.Err != nil {
+			logger.LogIf(logger.SetReqInfo(ctx, reqInfo), nErr.Err)
+		}
+	}
+}
+
+// StopRebalance notifies all MinIO nodes to signal any ongoing rebalance
+// goroutine to stop.
+func (sys *NotificationSys) StopRebalance(ctx context.Context) {
+	ng := WithNPeers(len(sys.peerClients))
+	for idx, client := range sys.peerClients {
+		if client == nil {
+			continue
+		}
+		client := client
+		ng.Go(ctx, func() error {
+			return client.StopRebalance(ctx)
+		}, idx, *client.host)
+	}
+	for _, nErr := range ng.Wait() {
+		reqInfo := (&logger.ReqInfo{}).AppendTags("peerAddress", nErr.Host.String())
+		if nErr.Err != nil {
+			logger.LogIf(logger.SetReqInfo(ctx, reqInfo), nErr.Err)
+		}
+	}
+}
+
+// LoadRebalanceMeta notifies all peers to load rebalance.bin from object layer.
+// Note: Only peers participating in rebalance operation, namely the first node
+// in each pool will load rebalance.bin.
+func (sys *NotificationSys) LoadRebalanceMeta(ctx context.Context, startRebalance bool) {
+	ng := WithNPeers(len(sys.peerClients))
+	for idx, client := range sys.peerClients {
+		if client == nil {
+			continue
+		}
+		client := client
+		ng.Go(ctx, func() error {
+			return client.LoadRebalanceMeta(ctx, startRebalance)
 		}, idx, *client.host)
 	}
 	for _, nErr := range ng.Wait() {

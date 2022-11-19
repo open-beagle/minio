@@ -29,6 +29,7 @@ import (
 	"github.com/minio/minio/internal/event"
 	xhttp "github.com/minio/minio/internal/http"
 	"github.com/minio/minio/internal/logger"
+	"github.com/minio/minio/internal/pubsub"
 	"github.com/minio/pkg/bucket/policy"
 )
 
@@ -98,11 +99,6 @@ func (evnot *EventNotifier) set(bucket BucketInfo, meta BucketMetadata) {
 func (evnot *EventNotifier) InitBucketTargets(ctx context.Context, objAPI ObjectLayer) error {
 	if objAPI == nil {
 		return errServerNotInitialized
-	}
-
-	// In gateway mode, notifications are not supported - except NAS gateway.
-	if globalIsGateway && !objAPI.IsNotificationSupported() {
-		return nil
 	}
 
 	if err := evnot.targetList.Add(globalConfigTargetList.Targets()...); err != nil {
@@ -326,11 +322,7 @@ func sendEvent(args eventArgs) {
 	crypto.RemoveSensitiveEntries(args.Object.UserDefined)
 	crypto.RemoveInternalEntries(args.Object.UserDefined)
 
-	// globalNotificationSys is not initialized in gateway mode.
-	if globalNotificationSys == nil {
-		return
-	}
-	if globalHTTPListen.NumSubscribers(args.EventName) > 0 {
+	if globalHTTPListen.NumSubscribers(pubsub.MaskFromMaskable(args.EventName)) > 0 {
 		globalHTTPListen.Publish(args.ToEvent(false))
 	}
 

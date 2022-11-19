@@ -58,6 +58,7 @@ func init() {
 		getCacheMetrics(),
 		getGoMetrics(),
 		getHTTPMetrics(),
+		getNotificationMetrics(),
 		getLocalStorageMetrics(),
 		getMinioProcMetrics(),
 		getMinioVersionMetrics(),
@@ -83,6 +84,7 @@ func init() {
 		getNetworkMetrics(),
 		getMinioVersionMetrics(),
 		getS3TTFBMetric(),
+		getNotificationMetrics(),
 	})
 	clusterCollector = newMinioClusterCollector(allMetricsGroups)
 }
@@ -127,6 +129,8 @@ const (
 	scannerSubsystem          MetricSubsystem = "scanner"
 	iamSubsystem              MetricSubsystem = "iam"
 	kmsSubsystem              MetricSubsystem = "kms"
+	notifySubsystem           MetricSubsystem = "notify"
+	auditSubsystem            MetricSubsystem = "audit"
 )
 
 // MetricName are the individual names for the metric.
@@ -1404,9 +1408,6 @@ func getMinioVersionMetrics() *MetricsGroup {
 func getNodeHealthMetrics() *MetricsGroup {
 	mg := &MetricsGroup{}
 	mg.RegisterRead(func(_ context.Context) (metrics []Metric) {
-		if globalIsGateway {
-			return
-		}
 		metrics = make([]Metric, 0, 16)
 		nodesUp, nodesDown := globalNotificationSys.GetPeerOnlineCount()
 		metrics = append(metrics, Metric{
@@ -1426,9 +1427,6 @@ func getMinioHealingMetrics() *MetricsGroup {
 	mg := &MetricsGroup{}
 	mg.RegisterRead(func(_ context.Context) (metrics []Metric) {
 		metrics = make([]Metric, 0, 5)
-		if globalIsGateway {
-			return
-		}
 		bgSeq, exists := globalBackgroundHealState.getHealSequenceByToken(bgHealingUUID)
 		if !exists {
 			return
@@ -1538,6 +1536,76 @@ func getCacheMetrics() *MetricsGroup {
 			})
 		}
 		return
+	})
+	return mg
+}
+
+func getNotificationMetrics() *MetricsGroup {
+	mg := &MetricsGroup{}
+	mg.RegisterRead(func(ctx context.Context) []Metric {
+		stats := globalConfigTargetList.Stats()
+		metrics := make([]Metric, 0, 1+len(stats.TargetStats))
+		metrics = append(metrics, Metric{
+			Description: MetricDescription{
+				Namespace: minioNamespace,
+				Subsystem: notifySubsystem,
+				Name:      "current_send_in_progress",
+				Help:      "Number of concurrent async Send calls active to all targets",
+				Type:      gaugeMetric,
+			},
+			Value: float64(stats.CurrentSendCalls),
+		})
+		for _, st := range stats.TargetStats {
+			metrics = append(metrics, Metric{
+				Description: MetricDescription{
+					Namespace: minioNamespace,
+					Subsystem: notifySubsystem,
+					Name:      "target_queue_length",
+					Help:      "Number of unsent notifications in queue for target",
+					Type:      gaugeMetric,
+				},
+				VariableLabels: map[string]string{"target_id": st.ID.ID, "target_name": st.ID.Name},
+				Value:          float64(st.CurrentQueue),
+			})
+		}
+		// Audit and system:
+		audit := logger.CurrentStats()
+		for id, st := range audit {
+			metrics = append(metrics, Metric{
+				Description: MetricDescription{
+					Namespace: minioNamespace,
+					Subsystem: auditSubsystem,
+					Name:      "target_queue_length",
+					Help:      "Number of unsent messages in queue for target",
+					Type:      gaugeMetric,
+				},
+				VariableLabels: map[string]string{"target_id": id},
+				Value:          float64(st.QueueLength),
+			})
+			metrics = append(metrics, Metric{
+				Description: MetricDescription{
+					Namespace: minioNamespace,
+					Subsystem: auditSubsystem,
+					Name:      "total_messages",
+					Help:      "Total number of messages sent since start",
+					Type:      counterMetric,
+				},
+				VariableLabels: map[string]string{"target_id": id},
+				Value:          float64(st.TotalMessages),
+			})
+			metrics = append(metrics, Metric{
+				Description: MetricDescription{
+					Namespace: minioNamespace,
+					Subsystem: auditSubsystem,
+					Name:      "failed_messages",
+					Help:      "Total number of messages that failed to send since start",
+					Type:      counterMetric,
+				},
+				VariableLabels: map[string]string{"target_id": id},
+				Value:          float64(st.FailedMessages),
+			})
+		}
+		return metrics
 	})
 	return mg
 }
@@ -1672,7 +1740,7 @@ func getBucketUsageMetrics() *MetricsGroup {
 	mg.RegisterRead(func(ctx context.Context) (metrics []Metric) {
 		objLayer := newObjectLayerFn()
 		// Service not initialized yet
-		if objLayer == nil || globalIsGateway {
+		if objLayer == nil {
 			return
 		}
 
@@ -1817,7 +1885,7 @@ func getClusterTierMetrics() *MetricsGroup {
 	}
 	mg.RegisterRead(func(ctx context.Context) (metrics []Metric) {
 		objLayer := newObjectLayerFn()
-		if objLayer == nil || globalIsGateway {
+		if objLayer == nil {
 			return
 		}
 		if globalTierConfigMgr.Empty() {
@@ -1845,7 +1913,7 @@ func getLocalStorageMetrics() *MetricsGroup {
 	mg.RegisterRead(func(ctx context.Context) (metrics []Metric) {
 		objLayer := newObjectLayerFn()
 		// Service not initialized yet
-		if objLayer == nil || globalIsGateway {
+		if objLayer == nil {
 			return
 		}
 
@@ -1889,7 +1957,7 @@ func getLocalDiskStorageMetrics() *MetricsGroup {
 	mg.RegisterRead(func(ctx context.Context) (metrics []Metric) {
 		objLayer := newObjectLayerFn()
 		// Service not initialized yet
-		if objLayer == nil || globalIsGateway {
+		if objLayer == nil {
 			return
 		}
 
@@ -1922,7 +1990,7 @@ func getClusterStorageMetrics() *MetricsGroup {
 	mg.RegisterRead(func(ctx context.Context) (metrics []Metric) {
 		objLayer := newObjectLayerFn()
 		// Service not initialized yet
-		if objLayer == nil || globalIsGateway {
+		if objLayer == nil {
 			return
 		}
 
@@ -1979,7 +2047,7 @@ func getKMSNodeMetrics() *MetricsGroup {
 	mg.RegisterRead(func(ctx context.Context) (metrics []Metric) {
 		objLayer := newObjectLayerFn()
 		// Service not initialized yet
-		if objLayer == nil || globalIsGateway || GlobalKMS == nil {
+		if objLayer == nil || GlobalKMS == nil {
 			return
 		}
 
@@ -2017,7 +2085,7 @@ func getKMSMetrics() *MetricsGroup {
 	mg.RegisterRead(func(ctx context.Context) []Metric {
 		objLayer := newObjectLayerFn()
 		// Service not initialized yet
-		if objLayer == nil || globalIsGateway || GlobalKMS == nil {
+		if objLayer == nil || GlobalKMS == nil {
 			return []Metric{}
 		}
 
