@@ -18,8 +18,12 @@
 package logger
 
 import (
+	"context"
+	"fmt"
+	"strings"
 	"sync"
 
+	"github.com/minio/madmin-go/v3"
 	"github.com/minio/minio/internal/logger/target/http"
 	"github.com/minio/minio/internal/logger/target/kafka"
 	"github.com/minio/minio/internal/logger/target/types"
@@ -32,9 +36,11 @@ import (
 type Target interface {
 	String() string
 	Endpoint() string
-	Init() error
+	Stats() types.TargetStats
+	Init(ctx context.Context) error
+	IsOnline(ctx context.Context) bool
 	Cancel()
-	Send(entry interface{}) error
+	Send(ctx context.Context, entry interface{}) error
 	Type() types.TargetType
 }
 
@@ -50,6 +56,18 @@ var (
 	// This is always set represent /dev/console target
 	consoleTgt Target
 )
+
+// TargetStatus returns status of the target (online|offline)
+func TargetStatus(ctx context.Context, h Target) madmin.Status {
+	if h.IsOnline(ctx) {
+		return madmin.Status{Status: string(madmin.ItemOnline)}
+	}
+	// Previous initialization had failed. Try again.
+	if e := h.Init(ctx); e == nil {
+		return madmin.Status{Status: string(madmin.ItemOnline)}
+	}
+	return madmin.Status{Status: string(madmin.ItemOffline)}
+}
 
 // SystemTargets returns active targets.
 // Returned slice may not be modified in any way.
@@ -71,6 +89,33 @@ func AuditTargets() []Target {
 	return res
 }
 
+// CurrentStats returns the current statistics.
+func CurrentStats() map[string]types.TargetStats {
+	sys := SystemTargets()
+	audit := AuditTargets()
+	res := make(map[string]types.TargetStats, len(sys)+len(audit))
+	cnt := make(map[string]int, len(sys)+len(audit))
+
+	// Add system and audit.
+	for _, t := range sys {
+		key := strings.ToLower(t.Type().String())
+		n := cnt[key]
+		cnt[key]++
+		key = fmt.Sprintf("sys_%s_%d", key, n)
+		res[key] = t.Stats()
+	}
+
+	for _, t := range audit {
+		key := strings.ToLower(t.Type().String())
+		n := cnt[key]
+		cnt[key]++
+		key = fmt.Sprintf("audit_%s_%d", key, n)
+		res[key] = t.Stats()
+	}
+
+	return res
+}
+
 // auditTargets is the list of enabled audit loggers
 // Must be immutable at all times.
 // Can be swapped to another while holding swapMu
@@ -80,8 +125,8 @@ var (
 
 // AddSystemTarget adds a new logger target to the
 // list of enabled loggers
-func AddSystemTarget(t Target) error {
-	if err := t.Init(); err != nil {
+func AddSystemTarget(ctx context.Context, t Target) error {
+	if err := t.Init(ctx); err != nil {
 		return err
 	}
 
@@ -100,30 +145,38 @@ func AddSystemTarget(t Target) error {
 	return nil
 }
 
-func initSystemTargets(cfgMap map[string]http.Config) (tgts []Target, err error) {
+func initSystemTargets(ctx context.Context, cfgMap map[string]http.Config) ([]Target, []error) {
+	tgts := []Target{}
+	errs := []error{}
 	for _, l := range cfgMap {
 		if l.Enabled {
 			t := http.New(l)
-			if err = t.Init(); err != nil {
-				return tgts, err
-			}
 			tgts = append(tgts, t)
+
+			e := t.Init(ctx)
+			if e != nil {
+				errs = append(errs, e)
+			}
 		}
 	}
-	return tgts, err
+	return tgts, errs
 }
 
-func initKafkaTargets(cfgMap map[string]kafka.Config) (tgts []Target, err error) {
+func initKafkaTargets(ctx context.Context, cfgMap map[string]kafka.Config) ([]Target, []error) {
+	tgts := []Target{}
+	errs := []error{}
 	for _, l := range cfgMap {
 		if l.Enabled {
 			t := kafka.New(l)
-			if err = t.Init(); err != nil {
-				return tgts, err
-			}
 			tgts = append(tgts, t)
+
+			e := t.Init(ctx)
+			if e != nil {
+				errs = append(errs, e)
+			}
 		}
 	}
-	return tgts, err
+	return tgts, errs
 }
 
 // Split targets into two groups:
@@ -148,11 +201,8 @@ func cancelTargets(targets []Target) {
 }
 
 // UpdateSystemTargets swaps targets with newly loaded ones from the cfg
-func UpdateSystemTargets(cfg Config) error {
-	newTgts, err := initSystemTargets(cfg.HTTP)
-	if err != nil {
-		return err
-	}
+func UpdateSystemTargets(ctx context.Context, cfg Config) []error {
+	newTgts, errs := initSystemTargets(ctx, cfg.HTTP)
 
 	swapSystemMuRW.Lock()
 	consoleTargets, otherTargets := splitTargets(systemTargets, types.TargetConsole)
@@ -161,15 +211,12 @@ func UpdateSystemTargets(cfg Config) error {
 	swapSystemMuRW.Unlock()
 
 	cancelTargets(otherTargets) // cancel running targets
-	return nil
+	return errs
 }
 
 // UpdateAuditWebhookTargets swaps audit webhook targets with newly loaded ones from the cfg
-func UpdateAuditWebhookTargets(cfg Config) error {
-	newWebhookTgts, err := initSystemTargets(cfg.AuditWebhook)
-	if err != nil {
-		return err
-	}
+func UpdateAuditWebhookTargets(ctx context.Context, cfg Config) []error {
+	newWebhookTgts, errs := initSystemTargets(ctx, cfg.AuditWebhook)
 
 	swapAuditMuRW.Lock()
 	// Retain kafka targets
@@ -179,15 +226,12 @@ func UpdateAuditWebhookTargets(cfg Config) error {
 	swapAuditMuRW.Unlock()
 
 	cancelTargets(oldWebhookTgts) // cancel running targets
-	return nil
+	return errs
 }
 
 // UpdateAuditKafkaTargets swaps audit kafka targets with newly loaded ones from the cfg
-func UpdateAuditKafkaTargets(cfg Config) error {
-	newKafkaTgts, err := initKafkaTargets(cfg.AuditKafka)
-	if err != nil {
-		return err
-	}
+func UpdateAuditKafkaTargets(ctx context.Context, cfg Config) []error {
+	newKafkaTgts, errs := initKafkaTargets(ctx, cfg.AuditKafka)
 
 	swapAuditMuRW.Lock()
 	// Retain webhook targets
@@ -197,5 +241,5 @@ func UpdateAuditKafkaTargets(cfg Config) error {
 	swapAuditMuRW.Unlock()
 
 	cancelTargets(oldKafkaTgts) // cancel running targets
-	return nil
+	return errs
 }

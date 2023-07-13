@@ -32,6 +32,14 @@ helm install --namespace minio --set rootUser=rootuser,rootPassword=rootpass123 
 
 The command deploys MinIO on the Kubernetes cluster in the default configuration. The [configuration](#configuration) section lists the parameters that can be configured during installation.
 
+### Installing the Chart (toy-setup)
+
+Minimal toy setup for testing purposes can be deployed using:
+
+```bash
+helm install --set resources.requests.memory=512Mi --set replicas=1 --set persistence.enabled=false --set mode=standalone --set rootUser=rootuser,rootPassword=rootpass123 --generate-name minio/minio
+```
+
 ### Upgrading the Chart
 
 You can use Helm to update MinIO version in a live release. Assuming your release is named as `my-release`, get the values using the command:
@@ -218,6 +226,22 @@ Description of the configuration parameters used above -
 - `users[].existingSecret` - secret name that contains the secretKey of user
 - `users[].existingSecretKey` - data key in existingSecret secret containing the secretKey
 - `users[].policy` - name of the policy to assign to user
+
+### Create service account after install
+
+Install the chart, specifying the service accounts you want to create after install:
+
+```bash
+helm install --set svcaccts[0].accessKey=accessKey,svcaccts[0].secretKey=secretKey,svcaccts[0].user=parentUser,svcaccts[1].accessKey=accessKey2,svcaccts[1].secretRef=existingSecret,svcaccts[1].secretKey=password,svcaccts[1].user=parentUser2 minio/minio
+```
+
+Description of the configuration parameters used above -
+
+- `svcaccts[].accessKey` - accessKey of service account
+- `svcaccts[].secretKey` - secretKey of svcacctsecretRef
+- `svcaccts[].existingSecret` - secret name that contains the secretKey of service account
+- `svcaccts[].existingSecretKey` - data key in existingSecret secret containing the secretKey
+- `svcaccts[].user` - name of the parent user to assign to service account
 
 ## Uninstalling the Chart
 

@@ -1100,6 +1100,7 @@ func testAPIPutObjectStreamSigV4Handler(obj ObjectLayer, instanceType, bucketNam
 		},
 		// Test case - 7
 		// Chunk with malformed encoding.
+		// Causes signature mismatch.
 		{
 			bucketName:         bucketName,
 			objectName:         objectName,
@@ -1107,7 +1108,7 @@ func testAPIPutObjectStreamSigV4Handler(obj ObjectLayer, instanceType, bucketNam
 			dataLen:            1024,
 			chunkSize:          1024,
 			expectedContent:    []byte{},
-			expectedRespStatus: http.StatusBadRequest,
+			expectedRespStatus: http.StatusForbidden,
 			accessKey:          credentials.AccessKey,
 			secretKey:          credentials.SecretKey,
 			shouldPass:         false,
@@ -1197,17 +1198,18 @@ func testAPIPutObjectStreamSigV4Handler(obj ObjectLayer, instanceType, bucketNam
 		rec := httptest.NewRecorder()
 		// construct HTTP request for Put Object end point.
 		var req *http.Request
-		if testCase.fault == chunkDateMismatch {
+		switch {
+		case testCase.fault == chunkDateMismatch:
 			req, err = newTestStreamingSignedBadChunkDateRequest(http.MethodPut,
 				getPutObjectURL("", testCase.bucketName, testCase.objectName),
 				int64(testCase.dataLen), testCase.chunkSize, bytes.NewReader(testCase.data),
 				testCase.accessKey, testCase.secretKey)
-		} else if testCase.contentEncoding == "" {
+		case testCase.contentEncoding == "":
 			req, err = newTestStreamingSignedRequest(http.MethodPut,
 				getPutObjectURL("", testCase.bucketName, testCase.objectName),
 				int64(testCase.dataLen), testCase.chunkSize, bytes.NewReader(testCase.data),
 				testCase.accessKey, testCase.secretKey)
-		} else if testCase.contentEncoding != "" {
+		case testCase.contentEncoding != "":
 			req, err = newTestStreamingSignedCustomEncodingRequest(http.MethodPut,
 				getPutObjectURL("", testCase.bucketName, testCase.objectName),
 				int64(testCase.dataLen), testCase.chunkSize, bytes.NewReader(testCase.data),
@@ -1267,7 +1269,7 @@ func testAPIPutObjectStreamSigV4Handler(obj ObjectLayer, instanceType, bucketNam
 				t.Fatalf("Test %d: %s: ContentEncoding is set to \"%s\" which is unexpected, expected \"%s\"", i+1, instanceType, objInfo.ContentEncoding, expectedContentEncoding)
 			}
 			buffer := new(bytes.Buffer)
-			r, err := obj.GetObjectNInfo(context.Background(), testCase.bucketName, testCase.objectName, nil, nil, readLock, opts)
+			r, err := obj.GetObjectNInfo(context.Background(), testCase.bucketName, testCase.objectName, nil, nil, opts)
 			if err != nil {
 				t.Fatalf("Test %d: %s: Failed to fetch the copied object: <ERROR> %s", i+1, instanceType, err)
 			}
@@ -1558,7 +1560,7 @@ func testAPIPutObjectHandler(obj ObjectLayer, instanceType, bucketName string, a
 		if testCase.expectedRespStatus == http.StatusOK {
 			buffer := new(bytes.Buffer)
 			// Fetch the object to check whether the content is same as the one uploaded via PutObject.
-			gr, err := obj.GetObjectNInfo(context.Background(), testCase.bucketName, testCase.objectName, nil, nil, readLock, opts)
+			gr, err := obj.GetObjectNInfo(context.Background(), testCase.bucketName, testCase.objectName, nil, nil, opts)
 			if err != nil {
 				t.Fatalf("Test %d: %s: Failed to fetch the copied object: <ERROR> %s", i, instanceType, err)
 			}
@@ -1607,7 +1609,7 @@ func testAPIPutObjectHandler(obj ObjectLayer, instanceType, bucketName string, a
 		if testCase.expectedRespStatus == http.StatusOK {
 			buffer := new(bytes.Buffer)
 			// Fetch the object to check whether the content is same as the one uploaded via PutObject.
-			gr, err := obj.GetObjectNInfo(context.Background(), testCase.bucketName, testCase.objectName, nil, nil, readLock, opts)
+			gr, err := obj.GetObjectNInfo(context.Background(), testCase.bucketName, testCase.objectName, nil, nil, opts)
 			if err != nil {
 				t.Fatalf("Test %d: %s: Failed to fetch the copied object: <ERROR> %s", i, instanceType, err)
 			}
@@ -1768,7 +1770,7 @@ func testAPICopyObjectPartHandlerSanity(obj ObjectLayer, instanceType, bucketNam
 	}
 
 	var buf bytes.Buffer
-	r, err := obj.GetObjectNInfo(context.Background(), bucketName, testObject, nil, nil, readLock, ObjectOptions{})
+	r, err := obj.GetObjectNInfo(context.Background(), bucketName, testObject, nil, nil, ObjectOptions{})
 	if err != nil {
 		t.Fatalf("Test: %s reading completed file failed: <ERROR> %v", instanceType, err)
 	}
@@ -2045,12 +2047,13 @@ func testAPICopyObjectPartHandler(obj ObjectLayer, instanceType, bucketName stri
 		var req *http.Request
 		// initialize HTTP NewRecorder, this records any mutations to response writer inside the handler.
 		rec := httptest.NewRecorder()
-		if !testCase.invalidPartNumber || !testCase.maximumPartNumber {
+		switch {
+		case !testCase.invalidPartNumber || !testCase.maximumPartNumber:
 			// construct HTTP request for copy object.
 			req, err = newTestSignedRequestV4(http.MethodPut, getCopyObjectPartURL("", testCase.bucketName, testObject, testCase.uploadID, "1"), 0, nil, testCase.accessKey, testCase.secretKey, nil)
-		} else if testCase.invalidPartNumber {
+		case testCase.invalidPartNumber:
 			req, err = newTestSignedRequestV4(http.MethodPut, getCopyObjectPartURL("", testCase.bucketName, testObject, testCase.uploadID, "abc"), 0, nil, testCase.accessKey, testCase.secretKey, nil)
-		} else if testCase.maximumPartNumber {
+		case testCase.maximumPartNumber:
 			req, err = newTestSignedRequestV4(http.MethodPut, getCopyObjectPartURL("", testCase.bucketName, testObject, testCase.uploadID, "99999"), 0, nil, testCase.accessKey, testCase.secretKey, nil)
 		}
 		if err != nil {
@@ -2483,7 +2486,7 @@ func testAPICopyObjectHandler(obj ObjectLayer, instanceType, bucketName string, 
 			// Note that this goes directly to the file system,
 			// so encryption/compression may interfere at some point.
 			buffers[0].Reset()
-			r, err := obj.GetObjectNInfo(context.Background(), testCase.bucketName, testCase.newObjectName, nil, nil, readLock, opts)
+			r, err := obj.GetObjectNInfo(context.Background(), testCase.bucketName, testCase.newObjectName, nil, nil, opts)
 			if err != nil {
 				t.Fatalf("Test %d: %s reading completed file failed: <ERROR> %v", i, instanceType, err)
 			}
@@ -3545,11 +3548,9 @@ func testAPIPutObjectPartHandlerStreaming(obj ObjectLayer, instanceType, bucketN
 				t.Errorf("Test %d %s expected to fail with error %s, but received %s", i+1, instanceType,
 					test.expectedErr.Code, errXML.Code)
 			}
-		} else {
-			if rec.Code != http.StatusOK {
-				t.Errorf("Test %d %s expected to succeed, but failed with HTTP status code %d",
-					i+1, instanceType, rec.Code)
-			}
+		} else if rec.Code != http.StatusOK {
+			t.Errorf("Test %d %s expected to succeed, but failed with HTTP status code %d",
+				i+1, instanceType, rec.Code)
 		}
 	}
 }
@@ -3691,6 +3692,27 @@ func testAPIPutObjectPartHandler(obj ObjectLayer, instanceType, bucketName strin
 			secretKey:  credentials.SecretKey,
 
 			expectedAPIError: ErrInvalidAccessKeyID,
+		},
+		// Case where part number is invalid.
+		9: {
+			objectName: testObject,
+			content:    "hello",
+			partNumber: "0",
+			fault:      None,
+			accessKey:  credentials.AccessKey,
+			secretKey:  credentials.SecretKey,
+
+			expectedAPIError: ErrInvalidPart,
+		},
+		10: {
+			objectName: testObject,
+			content:    "hello",
+			partNumber: "-10",
+			fault:      None,
+			accessKey:  credentials.AccessKey,
+			secretKey:  credentials.SecretKey,
+
+			expectedAPIError: ErrInvalidPart,
 		},
 	}
 
@@ -4119,10 +4141,8 @@ func testAPIListObjectPartsHandler(obj ObjectLayer, instanceType, bucketName str
 							reqType, test.expectedErr.Code, errXML.Code)
 					}
 					// in case error is not expected response status should be 200OK.
-				} else {
-					if rec.Code != http.StatusOK {
-						t.Errorf("%s, Expected to succeed with response HTTP status 200OK, but failed with HTTP status code %d.", reqType, rec.Code)
-					}
+				} else if rec.Code != http.StatusOK {
+					t.Errorf("%s, Expected to succeed with response HTTP status 200OK, but failed with HTTP status code %d.", reqType, rec.Code)
 				}
 			}
 		})

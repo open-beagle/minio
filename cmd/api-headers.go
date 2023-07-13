@@ -20,6 +20,7 @@ package cmd
 import (
 	"bytes"
 	"encoding/json"
+	"encoding/xml"
 	"fmt"
 	"net/http"
 	"net/url"
@@ -64,15 +65,31 @@ func setCommonHeaders(w http.ResponseWriter) {
 
 // Encodes the response headers into XML format.
 func encodeResponse(response interface{}) []byte {
-	var bytesBuffer bytes.Buffer
-	bytesBuffer.WriteString(xxml.Header)
-	buf, err := xxml.Marshal(response)
-	if err != nil {
+	var buf bytes.Buffer
+	buf.WriteString(xml.Header)
+	if err := xml.NewEncoder(&buf).Encode(response); err != nil {
 		logger.LogIf(GlobalContext, err)
 		return nil
 	}
-	bytesBuffer.Write(buf)
-	return bytesBuffer.Bytes()
+	return buf.Bytes()
+}
+
+// Use this encodeResponseList() to support control characters
+// this function must be used by only ListObjects() for objects
+// with control characters, this is a specialized extension
+// to support AWS S3 compatible behavior.
+//
+// Do not use this function for anything other than ListObjects()
+// variants, please open a github discussion if you wish to use
+// this in other places.
+func encodeResponseList(response interface{}) []byte {
+	var buf bytes.Buffer
+	buf.WriteString(xxml.Header)
+	if err := xxml.NewEncoder(&buf).Encode(response); err != nil {
+		logger.LogIf(GlobalContext, err)
+		return nil
+	}
+	return buf.Bytes()
 }
 
 // Encodes the response headers into JSON format.
@@ -136,7 +153,7 @@ func setObjectHeaders(w http.ResponseWriter, objInfo ObjectInfo, rs *HTTPRangeSp
 			continue
 		}
 
-		if strings.HasPrefix(strings.ToLower(k), ReservedMetadataPrefixLower) {
+		if stringsHasPrefixFold(k, ReservedMetadataPrefixLower) {
 			// Do not need to send any internal metadata
 			// values to client.
 			continue
@@ -149,7 +166,7 @@ func setObjectHeaders(w http.ResponseWriter, objInfo ObjectInfo, rs *HTTPRangeSp
 
 		var isSet bool
 		for _, userMetadataPrefix := range userMetadataKeyPrefixes {
-			if !strings.HasPrefix(strings.ToLower(k), strings.ToLower(userMetadataPrefix)) {
+			if !stringsHasPrefixFold(k, userMetadataPrefix) {
 				continue
 			}
 			w.Header()[strings.ToLower(k)] = []string{v}
@@ -186,7 +203,7 @@ func setObjectHeaders(w http.ResponseWriter, objInfo ObjectInfo, rs *HTTPRangeSp
 	}
 
 	// Set the relevant version ID as part of the response header.
-	if objInfo.VersionID != "" {
+	if objInfo.VersionID != "" && objInfo.VersionID != nullVersionID {
 		w.Header()[xhttp.AmzVersionID] = []string{objInfo.VersionID}
 	}
 

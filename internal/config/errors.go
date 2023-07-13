@@ -19,12 +19,6 @@ package config
 
 // UI errors
 var (
-	ErrInvalidFSValue = newErrFn(
-		"Invalid drive path",
-		"Please provide an existing deployment with MinIO",
-		"MinIO does not support newer NAS gateway deployments anymore refer https://github.com/minio/minio/issues/14331",
-	)
-
 	ErrInvalidXLValue = newErrFn(
 		"Invalid drive path",
 		"Please provide a fresh drive for single drive MinIO setup",
@@ -109,12 +103,6 @@ var (
 		"MINIO_CACHE_WATERMARK_HIGH: Valid cache high watermark value must be between 0-100",
 	)
 
-	ErrInvalidCacheEncryptionKey = newErrFn(
-		"Invalid cache encryption master key value",
-		"Please check the passed value",
-		"MINIO_CACHE_ENCRYPTION_SECRET_KEY: For more information, please refer to https://blog.min.io/deprecation-of-the-minio-gateway/",
-	)
-
 	ErrInvalidCacheRange = newErrFn(
 		"Invalid cache range value",
 		"Please check the passed value",
@@ -133,10 +121,10 @@ var (
 		"MINIO_CACHE_AFTER cannot be used with MINIO_CACHE_COMMIT setting",
 	)
 
-	ErrInvalidCredentialsBackendEncrypted = newErrFn(
-		"Invalid credentials",
-		"Please set correct credentials in the environment for decryption",
-		`Detected encrypted config backend, correct access and secret keys should be specified via environment variables MINIO_ROOT_USER and MINIO_ROOT_PASSWORD to be able to decrypt the MinIO config, user IAM and policies`,
+	ErrInvalidConfigDecryptionKey = newErrFn(
+		"Incorrect encryption key to decrypt internal data",
+		"Please set the correct default KMS key value or the correct root credentials for older MinIO versions.",
+		`Revert MINIO_KMS_KES_KEY_NAME or MINIO_ROOT_USER/MINIO_ROOT_PASSWORD (for older MinIO versions) to be able to decrypt the internal data again.`,
 	)
 
 	ErrInvalidCredentials = newErrFn(
@@ -204,12 +192,13 @@ Refer to the link https://github.com/minio/minio/tree/master/docs/erasure/storag
 		  --address '[fe80::da00:a6c8:e3ae:ddd7]:9000'`,
 	)
 
-	ErrInvalidFSEndpoint = newErrFn(
-		"Invalid endpoint for standalone FS mode",
-		"Please check the FS endpoint",
-		`FS mode requires only one writable disk path
-Example 1:
-   $ minio server /data/minio/`,
+	ErrInvalidEndpoint = newErrFn(
+		"Invalid endpoint for single drive mode",
+		"Please check the endpoint",
+		`Single-Node modes requires absolute path without hostnames:
+Examples:
+   $ minio server /data/minio/ #Single Node Single Drive
+   $ minio server /data-{1...4}/minio # Single Node Multi Drive`,
 	)
 
 	ErrUnsupportedBackend = newErrFn(
@@ -236,19 +225,19 @@ Example 1:
 		`Use 'sudo setcap cap_net_bind_service=+ep /path/to/minio' to provide sufficient permissions`,
 	)
 
-	ErrSSLUnexpectedError = newErrFn(
-		"Invalid TLS certificate",
-		"Please check the content of your certificate data",
-		`Only PEM (x.509) format is accepted as valid public & private certificates`,
+	ErrTLSReadError = newErrFn(
+		"Cannot read the TLS certificate",
+		"Please check if the certificate has the proper owner and read permissions",
+		"",
 	)
 
-	ErrSSLUnexpectedData = newErrFn(
+	ErrTLSUnexpectedData = newErrFn(
 		"Invalid TLS certificate",
 		"Please check your certificate",
 		"",
 	)
 
-	ErrSSLNoPassword = newErrFn(
+	ErrTLSNoPassword = newErrFn(
 		"Missing TLS password",
 		"Please set the password to environment variable `MINIO_CERT_PASSWD` so that the private key can be decrypted",
 		"",
@@ -266,7 +255,7 @@ Example 1:
 		"",
 	)
 
-	ErrSSLWrongPassword = newErrFn(
+	ErrTLSWrongPassword = newErrFn(
 		"Unable to decrypt the private key using the provided password",
 		"Please set the correct password in environment variable `MINIO_CERT_PASSWD`",
 		"",
@@ -282,18 +271,6 @@ Example 1:
 		"Invalid compression include value",
 		"Please check the passed value",
 		"Compress extensions/mime-types are delimited by `,`. For eg, MINIO_COMPRESS_MIME_TYPES=\"A,B,C\"",
-	)
-
-	ErrInvalidGWSSEValue = newErrFn(
-		"Invalid gateway SSE value",
-		"Please check the passed value",
-		"MINIO_GATEWAY_SSE: Gateway SSE accepts only C and S3 as valid values. Delimit by `;` to set more than one value",
-	)
-
-	ErrInvalidGWSSEEnvValue = newErrFn(
-		"Invalid gateway SSE configuration",
-		"",
-		"Refer to https://min.io/docs/minio/linux/administration/server-side-encryption/server-side-encryption-sse-kms.html#quickstart for setting up SSE",
 	)
 
 	ErrInvalidReplicationWorkersValue = newErrFn(

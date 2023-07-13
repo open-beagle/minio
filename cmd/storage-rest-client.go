@@ -23,7 +23,6 @@ import (
 	"encoding/gob"
 	"encoding/hex"
 	"errors"
-	"fmt"
 	"io"
 	"net/http"
 	"net/url"
@@ -33,7 +32,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/minio/madmin-go"
+	"github.com/minio/madmin-go/v3"
 	xhttp "github.com/minio/minio/internal/http"
 	"github.com/minio/minio/internal/logger"
 	"github.com/minio/minio/internal/rest"
@@ -46,13 +45,26 @@ func isNetworkError(err error) bool {
 	if err == nil {
 		return false
 	}
+
 	if nerr, ok := err.(*rest.NetworkError); ok {
-		return xnet.IsNetworkOrHostDown(nerr.Err, false)
+		if down := xnet.IsNetworkOrHostDown(nerr.Err, false); down {
+			return true
+		}
 	}
 
+	// More corner cases suitable for storage REST API
+	switch {
 	// A peer node can be in shut down phase and proactively
 	// return 503 server closed error,consider it as an offline node
-	return err.Error() == http.ErrServerClosed.Error()
+	case strings.Contains(err.Error(), http.ErrServerClosed.Error()):
+		return true
+	// Corner case, the server closed the connection with a keep-alive timeout
+	// some requests are not retried internally, such as POST request with written body
+	case strings.Contains(err.Error(), "server closed idle connection"):
+		return true
+	}
+
+	return false
 }
 
 // Converts network error to storageErr. This function is
@@ -214,7 +226,8 @@ func (client *storageRESTClient) NSScanner(ctx context.Context, cache dataUsageC
 		rw.CloseWithError(waitForHTTPStream(respBody, rw))
 	}()
 
-	ms := msgp.NewReader(rr)
+	ms := msgpNewReader(rr)
+	defer readMsgpReaderPoolPut(ms)
 	for {
 		// Read whether it is an update.
 		upd, err := ms.ReadBool()
@@ -259,7 +272,7 @@ func (client *storageRESTClient) SetDiskID(id string) {
 }
 
 // DiskInfo - fetch disk information for a remote disk.
-func (client *storageRESTClient) DiskInfo(ctx context.Context) (info DiskInfo, err error) {
+func (client *storageRESTClient) DiskInfo(_ context.Context) (info DiskInfo, err error) {
 	if !client.IsOnline() {
 		// make sure to check if the disk is offline, since the underlying
 		// value is cached we should attempt to invalidate it if such calls
@@ -272,7 +285,7 @@ func (client *storageRESTClient) DiskInfo(ctx context.Context) (info DiskInfo, e
 		client.diskInfoCache.TTL = time.Second
 		client.diskInfoCache.Update = func() (interface{}, error) {
 			var info DiskInfo
-			ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancel()
 			respBody, err := client.call(ctx, storageRESTMethodDiskInfo, nil, nil, -1)
 			if err != nil {
@@ -485,14 +498,22 @@ var readMsgpReaderPool = sync.Pool{New: func() interface{} { return &msgp.Reader
 
 // mspNewReader returns a *Reader that reads from the provided reader.
 // The reader will be buffered.
+// Return with readMsgpReaderPoolPut when done.
 func msgpNewReader(r io.Reader) *msgp.Reader {
 	p := readMsgpReaderPool.Get().(*msgp.Reader)
 	if p.R == nil {
-		p.R = xbufio.NewReaderSize(r, 8<<10)
+		p.R = xbufio.NewReaderSize(r, 4<<10)
 	} else {
 		p.R.Reset(r)
 	}
 	return p
+}
+
+// readMsgpReaderPoolPut can be used to reuse a *msgp.Reader.
+func readMsgpReaderPoolPut(r *msgp.Reader) {
+	if r != nil {
+		readMsgpReaderPool.Put(r)
+	}
 }
 
 func (client *storageRESTClient) ReadVersion(ctx context.Context, volume, path, versionID string, readData bool) (fi FileInfo, err error) {
@@ -509,7 +530,7 @@ func (client *storageRESTClient) ReadVersion(ctx context.Context, volume, path, 
 	defer xhttp.DrainBody(respBody)
 
 	dec := msgpNewReader(respBody)
-	defer readMsgpReaderPool.Put(dec)
+	defer readMsgpReaderPoolPut(dec)
 
 	err = fi.DecodeMsg(dec)
 	return fi, err
@@ -528,7 +549,7 @@ func (client *storageRESTClient) ReadXL(ctx context.Context, volume string, path
 	defer xhttp.DrainBody(respBody)
 
 	dec := msgpNewReader(respBody)
-	defer readMsgpReaderPool.Put(dec)
+	defer readMsgpReaderPoolPut(dec)
 
 	err = rf.DecodeMsg(dec)
 	return rf, err
@@ -711,7 +732,7 @@ func (client *storageRESTClient) StatInfoFile(ctx context.Context, volume, path 
 	values := make(url.Values)
 	values.Set(storageRESTVolume, volume)
 	values.Set(storageRESTFilePath, path)
-	values.Set(storageRESTGlob, fmt.Sprint(glob))
+	values.Set(storageRESTGlob, strconv.FormatBool(glob))
 	respBody, err := client.call(ctx, storageRESTMethodStatInfoFile, values, nil, -1)
 	if err != nil {
 		return stat, err
@@ -722,6 +743,7 @@ func (client *storageRESTClient) StatInfoFile(ctx context.Context, volume, path 
 		return stat, err
 	}
 	rd := msgpNewReader(respReader)
+	defer readMsgpReaderPoolPut(rd)
 	for {
 		var st StatInfo
 		err = st.DecodeMsg(rd)
@@ -760,6 +782,7 @@ func (client *storageRESTClient) ReadMultiple(ctx context.Context, req ReadMulti
 		pw.CloseWithError(waitForHTTPStream(respBody, pw))
 	}()
 	mr := msgp.NewReader(pr)
+	defer readMsgpReaderPoolPut(mr)
 	for {
 		var file ReadMultipleResp
 		if err := file.DecodeMsg(mr); err != nil {
@@ -775,6 +798,24 @@ func (client *storageRESTClient) ReadMultiple(ctx context.Context, req ReadMulti
 		case resp <- file:
 		}
 	}
+}
+
+// CleanAbandonedData will read metadata of the object on disk
+// and delete any data directories and inline data that isn't referenced in metadata.
+func (client *storageRESTClient) CleanAbandonedData(ctx context.Context, volume string, path string) error {
+	values := make(url.Values)
+	values.Set(storageRESTVolume, volume)
+	values.Set(storageRESTFilePath, path)
+	respBody, err := client.call(ctx, storageRESTMethodCleanAbandoned, values, nil, -1)
+	if err != nil {
+		return err
+	}
+	defer xhttp.DrainBody(respBody)
+	respReader, err := waitForHTTPResponse(respBody)
+	if err == nil {
+		io.Copy(io.Discard, respReader)
+	}
+	return err
 }
 
 // Close - marks the client as closed.
@@ -796,7 +837,6 @@ func newStorageRESTClient(endpoint Endpoint, healthcheck bool) *storageRESTClien
 	if healthcheck {
 		// Use a separate client to avoid recursive calls.
 		healthClient := rest.NewClient(serverURL, globalInternodeTransport, newCachedAuthToken())
-		healthClient.ExpectTimeouts = true
 		healthClient.NoMetrics = true
 		restClient.HealthCheckFn = func() bool {
 			ctx, cancel := context.WithTimeout(context.Background(), restClient.HealthCheckTimeout)

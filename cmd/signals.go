@@ -24,6 +24,7 @@ import (
 	"os"
 	"strings"
 
+	"github.com/coreos/go-systemd/v22/daemon"
 	"github.com/minio/minio/internal/logger"
 )
 
@@ -50,10 +51,6 @@ func handleSignals() {
 		// send signal to various go-routines that they need to quit.
 		cancelGlobalContext()
 
-		if globalEventNotifier != nil {
-			globalEventNotifier.RemoveAllRemoteTargets()
-		}
-
 		if httpServer := newHTTPServerFn(); httpServer != nil {
 			err = httpServer.Shutdown()
 			if !errors.Is(err, http.ErrServerClosed) {
@@ -70,6 +67,10 @@ func handleSignals() {
 			logger.LogIf(context.Background(), srv.Shutdown())
 		}
 
+		if globalEventNotifier != nil {
+			globalEventNotifier.RemoveAllBucketTargets()
+		}
+
 		return (err == nil && oerr == nil)
 	}
 
@@ -79,24 +80,24 @@ func handleSignals() {
 			logger.LogIf(context.Background(), err)
 			exit(stopProcess())
 		case osSignal := <-globalOSSignalCh:
-			if !globalIsGateway {
-				globalReplicationPool.SaveState(context.Background())
-			}
 			logger.Info("Exiting on signal: %s", strings.ToUpper(osSignal.String()))
+			daemon.SdNotify(false, daemon.SdNotifyStopping)
 			exit(stopProcess())
 		case signal := <-globalServiceSignalCh:
-			if !globalIsGateway {
-				globalReplicationPool.SaveState(context.Background())
-			}
 			switch signal {
 			case serviceRestart:
 				logger.Info("Restarting on service signal")
+				daemon.SdNotify(false, daemon.SdNotifyReloading)
 				stop := stopProcess()
 				rerr := restartProcess()
+				if rerr == nil {
+					daemon.SdNotify(false, daemon.SdNotifyReady)
+				}
 				logger.LogIf(context.Background(), rerr)
 				exit(stop && rerr == nil)
 			case serviceStop:
 				logger.Info("Stopping on service signal")
+				daemon.SdNotify(false, daemon.SdNotifyStopping)
 				exit(stopProcess())
 			}
 		}

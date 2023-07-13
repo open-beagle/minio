@@ -18,7 +18,6 @@
 package openid
 
 import (
-	"crypto"
 	"crypto/sha1"
 	"encoding/base64"
 	"errors"
@@ -30,7 +29,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/minio/madmin-go"
+	"github.com/minio/madmin-go/v3"
 	"github.com/minio/minio-go/v7/pkg/set"
 	"github.com/minio/minio/internal/arn"
 	"github.com/minio/minio/internal/auth"
@@ -198,17 +197,14 @@ func LookupConfig(s config.Config, transport http.RoundTripper, closeRespFn func
 		ProviderCfgs:       map[string]*providerCfg{},
 		pubKeys: publicKeys{
 			RWMutex: &sync.RWMutex{},
-			pkMap:   map[string]crypto.PublicKey{},
+			pkMap:   map[string]interface{}{},
 		},
 		roleArnPolicyMap: map[arn.ARN]string{},
 		transport:        openIDClientTransport,
 		closeRespFn:      closeRespFn,
 	}
 
-	var (
-		hasLegacyPolicyMapping = false
-		seenClientIDs          = set.NewStringSet()
-	)
+	seenClientIDs := set.NewStringSet()
 
 	deprecatedKeys := []string{JwksURL}
 
@@ -234,7 +230,7 @@ func LookupConfig(s config.Config, transport http.RoundTripper, closeRespFn func
 		getCfgVal := func(cfgParam string) string {
 			// As parameters are already validated, we skip checking
 			// if the config param was found.
-			val, _ := s.ResolveConfigParam(config.IdentityOpenIDSubSys, cfgName, cfgParam)
+			val, _, _ := s.ResolveConfigParam(config.IdentityOpenIDSubSys, cfgName, cfgParam, false)
 			return val
 		}
 
@@ -247,11 +243,8 @@ func LookupConfig(s config.Config, transport http.RoundTripper, closeRespFn func
 		// parameters are non-empty.
 		var (
 			cfgEnableVal        = getCfgVal(config.Enable)
-			isExplicitlyEnabled = false
+			isExplicitlyEnabled = cfgEnableVal != ""
 		)
-		if cfgEnableVal != "" {
-			isExplicitlyEnabled = true
-		}
 
 		var enabled bool
 		if isExplicitlyEnabled {
@@ -377,9 +370,8 @@ func LookupConfig(s config.Config, transport http.RoundTripper, closeRespFn func
 		arnKey := p.roleArn
 		if p.RolePolicy == "" {
 			arnKey = DummyRoleARN
-			hasLegacyPolicyMapping = true
-			// Ensure that when a JWT policy claim based provider
-			// exists, it is the only one.
+			// Ensure that at most one JWT policy claim based provider may be
+			// defined.
 			if _, ok := c.arnProviderCfgsMap[DummyRoleARN]; ok {
 				return c, errSingleProvider
 			}
@@ -391,12 +383,6 @@ func LookupConfig(s config.Config, transport http.RoundTripper, closeRespFn func
 		if err = c.PopulatePublicKey(arnKey); err != nil {
 			return c, err
 		}
-	}
-
-	// Ensure that when a JWT policy claim based provider
-	// exists, it is the only one.
-	if hasLegacyPolicyMapping && len(c.ProviderCfgs) > 1 {
-		return c, errSingleProvider
 	}
 
 	c.Enabled = true
@@ -427,24 +413,28 @@ func (r *Config) GetConfigInfo(s config.Config, cfgName string) ([]madmin.IDPCfg
 		return nil, ErrProviderConfigNotFound
 	}
 
-	kvsrcs, err := s.GetResolvedConfigParams(config.IdentityOpenIDSubSys, cfgName)
+	kvsrcs, err := s.GetResolvedConfigParams(config.IdentityOpenIDSubSys, cfgName, true)
 	if err != nil {
 		return nil, err
 	}
 
 	res := make([]madmin.IDPCfgInfo, 0, len(kvsrcs)+1)
 	for _, kvsrc := range kvsrcs {
-		// skip default values.
+		// skip returning default config values.
 		if kvsrc.Src == config.ValueSourceDef {
 			if kvsrc.Key != madmin.EnableKey {
 				continue
 			}
-			// set an explicit on/off from live configuration.
-			kvsrc.Value = "off"
-			if _, ok := r.ProviderCfgs[cfgName]; ok {
-				if r.Enabled {
-					kvsrc.Value = "on"
-				}
+			// for EnableKey we set an explicit on/off from live configuration
+			// if it is present.
+			if _, ok := r.ProviderCfgs[cfgName]; !ok {
+				// No live config is present
+				continue
+			}
+			if r.Enabled {
+				kvsrc.Value = "on"
+			} else {
+				kvsrc.Value = "off"
 			}
 		}
 		res = append(res, madmin.IDPCfgInfo{
@@ -517,14 +507,13 @@ func (r *Config) GetSettings() madmin.OpenIDSettings {
 	if !r.Enabled {
 		return res
 	}
-
+	h := sha256.New()
 	for arn, provCfg := range r.arnProviderCfgsMap {
 		hashedSecret := ""
 		{
-			h := sha256.New()
+			h.Reset()
 			h.Write([]byte(provCfg.ClientSecret))
-			bs := h.Sum(nil)
-			hashedSecret = base64.RawURLEncoding.EncodeToString(bs)
+			hashedSecret = base64.RawURLEncoding.EncodeToString(h.Sum(nil))
 		}
 		if arn != DummyRoleARN {
 			if res.Roles == nil {

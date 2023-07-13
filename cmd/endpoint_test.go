@@ -62,13 +62,14 @@ func TestNewEndpoint(t *testing.T) {
 				err = endpoint.UpdateIsLocal()
 			}
 
-			if test.expectedErr == nil {
+			switch {
+			case test.expectedErr == nil:
 				if err != nil {
 					t.Errorf("error: expected = <nil>, got = %v", err)
 				}
-			} else if err == nil {
+			case err == nil:
 				t.Errorf("error: expected = %v, got = <nil>", test.expectedErr)
-			} else if test.expectedErr.Error() != err.Error() {
+			case test.expectedErr.Error() != err.Error():
 				t.Errorf("error: expected = %v, got = %v", test.expectedErr, err)
 			}
 
@@ -115,13 +116,14 @@ func TestNewEndpoints(t *testing.T) {
 
 	for _, testCase := range testCases {
 		_, err := NewEndpoints(testCase.args...)
-		if testCase.expectedErr == nil {
+		switch {
+		case testCase.expectedErr == nil:
 			if err != nil {
 				t.Fatalf("error: expected = <nil>, got = %v", err)
 			}
-		} else if err == nil {
+		case err == nil:
 			t.Fatalf("error: expected = %v, got = <nil>", testCase.expectedErr)
-		} else if testCase.expectedErr.Error() != err.Error() {
+		case testCase.expectedErr.Error() != err.Error():
 			t.Fatalf("error: expected = %v, got = %v", testCase.expectedErr, err)
 		}
 	}
@@ -312,7 +314,7 @@ func TestCreateEndpoints(t *testing.T) {
 	for _, testCase := range testCases {
 		testCase := testCase
 		t.Run("", func(t *testing.T) {
-			endpoints, setupType, err := CreateEndpoints(testCase.serverAddr, false, testCase.args...)
+			endpoints, setupType, err := CreateEndpoints(testCase.serverAddr, testCase.args...)
 			if err == nil && testCase.expectedErr != nil {
 				t.Errorf("error: expected = %v, got = <nil>", testCase.expectedErr)
 			}
@@ -370,9 +372,9 @@ func TestGetLocalPeer(t *testing.T) {
 	}
 
 	for i, testCase := range testCases {
-		zendpoints := mustGetPoolEndpoints(testCase.endpointArgs...)
+		zendpoints := mustGetPoolEndpoints(0, testCase.endpointArgs...)
 		if !zendpoints[0].Endpoints[0].IsLocal {
-			if err := zendpoints[0].Endpoints.UpdateIsLocal(false); err != nil {
+			if err := zendpoints[0].Endpoints.UpdateIsLocal(); err != nil {
 				t.Fatalf("error: expected = <nil>, got = %v", err)
 			}
 		}
@@ -403,9 +405,9 @@ func TestGetRemotePeers(t *testing.T) {
 	}
 
 	for _, testCase := range testCases {
-		zendpoints := mustGetPoolEndpoints(testCase.endpointArgs...)
+		zendpoints := mustGetPoolEndpoints(0, testCase.endpointArgs...)
 		if !zendpoints[0].Endpoints[0].IsLocal {
-			if err := zendpoints[0].Endpoints.UpdateIsLocal(false); err != nil {
+			if err := zendpoints[0].Endpoints.UpdateIsLocal(); err != nil {
 				t.Errorf("error: expected = <nil>, got = %v", err)
 			}
 		}

@@ -24,7 +24,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/minio/madmin-go"
+	"github.com/minio/madmin-go/v3"
 	"github.com/minio/minio/internal/auth"
 	xhttp "github.com/minio/minio/internal/http"
 )
@@ -150,10 +150,8 @@ func TestSkipContentSha256Cksum(t *testing.T) {
 				q.Add(testCase.inputHeaderKey, testCase.inputHeaderValue)
 			}
 			inputReq.URL.RawQuery = q.Encode()
-		} else {
-			if testCase.inputHeaderKey != "" {
-				inputReq.Header.Set(testCase.inputHeaderKey, testCase.inputHeaderValue)
-			}
+		} else if testCase.inputHeaderKey != "" {
+			inputReq.Header.Set(testCase.inputHeaderKey, testCase.inputHeaderValue)
 		}
 		inputReq.ParseForm()
 

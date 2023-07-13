@@ -41,6 +41,7 @@ import (
 	"github.com/minio/pkg/env"
 	xnet "github.com/minio/pkg/net"
 	"github.com/minio/selfupdate"
+	gopsutilcpu "github.com/shirou/gopsutil/v3/cpu"
 )
 
 const (
@@ -120,13 +121,27 @@ func GetCurrentReleaseTime() (releaseTime time.Time, err error) {
 // IsDocker - returns if the environment minio is running in docker or
 // not. The check is a simple file existence check.
 //
-// https://github.com/moby/moby/blob/master/daemon/initlayer/setup_unix.go#L25
+// https://github.com/moby/moby/blob/master/daemon/initlayer/setup_unix.go
+// https://github.com/containers/podman/blob/master/libpod/runtime.go
 //
-//	"/.dockerenv":      "file",
+//	"/.dockerenv":        "file",
+//	"/run/.containerenv": "file",
 func IsDocker() bool {
-	_, err := os.Stat("/.dockerenv")
+	var err error
+	for _, envfile := range []string{
+		"/.dockerenv",
+		"/run/.containerenv",
+	} {
+		_, err = os.Stat(envfile)
+		if err == nil {
+			return true
+		}
+	}
 	if osIsNotExist(err) {
-		return false
+		// if none of the files are present we may be running inside
+		// CRI-O, Containerd etc..
+		// Fallback to our container specific ENVs if they are set.
+		return env.IsSet("MINIO_ACCESS_KEY_FILE")
 	}
 
 	// Log error, as we will not propagate it to caller
@@ -181,7 +196,7 @@ func getHelmVersion(helmInfoFilePath string) string {
 		}
 		return ""
 	}
-
+	defer helmInfoFile.Close()
 	scanner := bufio.NewScanner(helmInfoFile)
 	for scanner.Scan() {
 		if strings.Contains(scanner.Text(), "chart=") {
@@ -275,6 +290,18 @@ func getUserAgent(mode string) string {
 		if pcfTileVersion != "" {
 			uaAppend(" MinIO/pcf-tile-", pcfTileVersion)
 		}
+	}
+
+	if cpus, err := gopsutilcpu.Info(); err == nil && len(cpus) > 0 {
+		cpuMap := make(map[string]struct{}, len(cpus))
+		coreMap := make(map[string]struct{}, len(cpus))
+		for i := range cpus {
+			cpuMap[cpus[i].PhysicalID] = struct{}{}
+			coreMap[cpus[i].CoreID] = struct{}{}
+		}
+		cpu := cpus[0]
+		uaAppend(" CPU ", fmt.Sprintf("(total_cpus:%d, total_cores:%d; vendor:%s; family:%s; model:%s; stepping:%d; model_name:%s)",
+			len(cpuMap), len(coreMap), cpu.VendorID, cpu.Family, cpu.Model, cpu.Stepping, cpu.ModelName))
 	}
 
 	return strings.Join(userAgentParts, "")
@@ -390,7 +417,7 @@ func parseReleaseData(data string) (sha256Sum []byte, releaseTime time.Time, rel
 func getUpdateTransport(timeout time.Duration) http.RoundTripper {
 	var updateTransport http.RoundTripper = &http.Transport{
 		Proxy:                 http.ProxyFromEnvironment,
-		DialContext:           xhttp.NewCustomDialContext(timeout),
+		DialContext:           xhttp.NewCustomDialContext(timeout, globalTCPOptions),
 		IdleConnTimeout:       timeout,
 		TLSHandshakeTimeout:   timeout,
 		ExpectContinueTimeout: timeout,
@@ -495,7 +522,7 @@ func downloadBinary(u *url.URL, mode string) (readerReturn []byte, err error) {
 	} else {
 		return nil, fmt.Errorf("unsupported protocol scheme: %s", u.Scheme)
 	}
-
+	defer xhttp.DrainBody(reader)
 	// convert a Reader to bytes
 	binaryFile, err := io.ReadAll(reader)
 	if err != nil {
@@ -505,7 +532,12 @@ func downloadBinary(u *url.URL, mode string) (readerReturn []byte, err error) {
 	return binaryFile, nil
 }
 
-func verifyBinary(u *url.URL, sha256Sum []byte, releaseInfo string, mode string, reader []byte) (err error) {
+const (
+	// Update this whenever the official minisign pubkey is rotated.
+	defaultMinisignPubkey = "RWTx5Zr1tiHQLwG9keckT0c45M3AGeHD6IvimQHpyRywVWGbP1aVSGav"
+)
+
+func verifyBinary(u *url.URL, sha256Sum []byte, releaseInfo, mode string, reader []byte) (err error) {
 	if !atomic.CompareAndSwapUint32(&updateInProgress, 0, 1) {
 		return errors.New("update already in progress")
 	}
@@ -525,7 +557,7 @@ func verifyBinary(u *url.URL, sha256Sum []byte, releaseInfo string, mode string,
 		}
 	}
 
-	minisignPubkey := env.Get(envMinisignPubKey, "")
+	minisignPubkey := env.Get(envMinisignPubKey, defaultMinisignPubkey)
 	if minisignPubkey != "" {
 		v := selfupdate.NewVerifier()
 		u.Path = path.Dir(u.Path) + slashSeparator + releaseInfo + ".minisig"

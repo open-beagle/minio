@@ -33,7 +33,7 @@ import (
 	"github.com/minio/minio/internal/config/storageclass"
 	xioutil "github.com/minio/minio/internal/ioutil"
 	"github.com/minio/minio/internal/logger"
-	"github.com/minio/minio/internal/sync/errgroup"
+	"github.com/minio/pkg/sync/errgroup"
 )
 
 const (
@@ -177,7 +177,7 @@ func formatGetBackendErasureVersion(b []byte) (string, error) {
 		return "", fmt.Errorf(`format.Version expected: %s, got: %s`, formatMetaVersionV1, meta.Version)
 	}
 	if meta.Format != formatBackendErasure && meta.Format != formatBackendErasureSingle {
-		return "", fmt.Errorf(`found backend type %s, expected %s or %s`, meta.Format, formatBackendErasure, formatBackendErasureSingle)
+		return "", fmt.Errorf(`found backend type %s, expected %s or %s - to migrate to a supported backend visit https://min.io/docs/minio/linux/operations/install-deploy-manage/migrate-fs-gateway.html`, meta.Format, formatBackendErasure, formatBackendErasureSingle)
 	}
 	// Erasure backend found, proceed to detect version.
 	format := &formatErasureVersionDetect{}
@@ -304,11 +304,6 @@ func countErrs(errs []error, err error) int {
 	return i
 }
 
-// Does all errors indicate we need to initialize all disks?.
-func shouldInitErasureDisks(errs []error) bool {
-	return countErrs(errs, errUnformattedDisk) == len(errs)
-}
-
 // Check if unformatted disks are equal to write quorum.
 func quorumUnformattedDisks(errs []error) bool {
 	return countErrs(errs, errUnformattedDisk) >= (len(errs)/2)+1
@@ -347,7 +342,7 @@ func loadFormatErasureAll(storageDisks []StorageAPI, heal bool) ([]*formatErasur
 	return formats, g.Wait()
 }
 
-func saveFormatErasure(disk StorageAPI, format *formatErasureV3, heal bool) error {
+func saveFormatErasure(disk StorageAPI, format *formatErasureV3, healID string) error {
 	if disk == nil || format == nil {
 		return errDiskNotFound
 	}
@@ -383,9 +378,9 @@ func saveFormatErasure(disk StorageAPI, format *formatErasureV3, heal bool) erro
 	}
 
 	disk.SetDiskID(diskID)
-	if heal {
+	if healID != "" {
 		ctx := context.Background()
-		ht := newHealingTracker(disk)
+		ht := initHealingTracker(disk, healID)
 		return ht.save(ctx)
 	}
 	return nil
@@ -541,7 +536,7 @@ func formatErasureFixLocalDeploymentID(endpoints Endpoints, storageDisks []Stora
 				}
 				format.ID = refFormat.ID
 				// Heal the drive if we fixed its deployment ID.
-				if err := saveFormatErasure(storageDisks[index], format, true); err != nil {
+				if err := saveFormatErasure(storageDisks[index], format, mustGetUUID()); err != nil {
 					logger.LogIf(GlobalContext, err)
 					return fmt.Errorf("Unable to save format.json, %w", err)
 				}
@@ -642,7 +637,7 @@ func saveFormatErasureAll(ctx context.Context, storageDisks []StorageAPI, format
 			if formats[index] == nil {
 				return errDiskNotFound
 			}
-			return saveFormatErasure(storageDisks[index], formats[index], false)
+			return saveFormatErasure(storageDisks[index], formats[index], "")
 		}, index)
 	}
 
@@ -666,30 +661,16 @@ func closeStorageDisks(storageDisks ...StorageAPI) {
 	wg.Wait()
 }
 
-func initStorageDisksWithErrorsWithoutHealthCheck(endpoints Endpoints) ([]StorageAPI, []error) {
-	// Bootstrap disks.
-	storageDisks := make([]StorageAPI, len(endpoints))
-	g := errgroup.WithNErrs(len(endpoints))
-	for index := range endpoints {
-		index := index
-		g.Go(func() (err error) {
-			storageDisks[index], err = newStorageAPIWithoutHealthCheck(endpoints[index])
-			return err
-		}, index)
-	}
-	return storageDisks, g.Wait()
-}
-
 // Initialize storage disks for each endpoint.
 // Errors are returned for each endpoint with matching index.
-func initStorageDisksWithErrors(endpoints Endpoints) ([]StorageAPI, []error) {
+func initStorageDisksWithErrors(endpoints Endpoints, healthCheck bool) ([]StorageAPI, []error) {
 	// Bootstrap disks.
 	storageDisks := make([]StorageAPI, len(endpoints))
 	g := errgroup.WithNErrs(len(endpoints))
 	for index := range endpoints {
 		index := index
 		g.Go(func() (err error) {
-			storageDisks[index], err = newStorageAPI(endpoints[index])
+			storageDisks[index], err = newStorageAPI(endpoints[index], healthCheck)
 			return err
 		}, index)
 	}
@@ -736,7 +717,7 @@ func fixFormatErasureV3(storageDisks []StorageAPI, endpoints Endpoints, formats 
 			if formats[i].Erasure.This == "" {
 				formats[i].Erasure.This = formats[i].Erasure.Sets[0][i]
 				// Heal the drive if drive has .This empty.
-				if err := saveFormatErasure(storageDisks[i], formats[i], true); err != nil {
+				if err := saveFormatErasure(storageDisks[i], formats[i], mustGetUUID()); err != nil {
 					return err
 				}
 			}
@@ -755,12 +736,18 @@ func fixFormatErasureV3(storageDisks []StorageAPI, endpoints Endpoints, formats 
 func initFormatErasure(ctx context.Context, storageDisks []StorageAPI, setCount, setDriveCount int, deploymentID, distributionAlgo string, sErrs []error) (*formatErasureV3, error) {
 	format := newFormatErasureV3(setCount, setDriveCount)
 	formats := make([]*formatErasureV3, len(storageDisks))
-	wantAtMost := ecDrivesNoConfig(setDriveCount)
+	wantAtMost, err := ecDrivesNoConfig(setDriveCount)
+	if err != nil {
+		return nil, err
+	}
 
 	for i := 0; i < setCount; i++ {
 		hostCount := make(map[string]int, setDriveCount)
 		for j := 0; j < setDriveCount; j++ {
 			disk := storageDisks[i*setDriveCount+j]
+			if disk == nil {
+				continue
+			}
 			newFormat := format.Clone()
 			newFormat.Erasure.This = format.Erasure.Sets[i][j]
 			if distributionAlgo != "" {
@@ -772,26 +759,24 @@ func initFormatErasure(ctx context.Context, storageDisks []StorageAPI, setCount,
 			hostCount[disk.Hostname()]++
 			formats[i*setDriveCount+j] = newFormat
 		}
-		if len(hostCount) > 0 {
-			var once sync.Once
-			for host, count := range hostCount {
-				if count > wantAtMost {
-					if host == "" {
-						host = "local"
-					}
-					once.Do(func() {
-						if len(hostCount) == 1 {
-							return
-						}
-						logger.Info(" * Set %v:", i+1)
-						for j := 0; j < setDriveCount; j++ {
-							disk := storageDisks[i*setDriveCount+j]
-							logger.Info("   - Drive: %s", disk.String())
-						}
-					})
-					logger.Info(color.Yellow("WARNING:")+" Host %v has more than %v drives of set. "+
-						"A host failure will result in data becoming unavailable.", host, wantAtMost)
+		var once sync.Once
+		for host, count := range hostCount {
+			if count > wantAtMost {
+				if host == "" {
+					host = "local"
 				}
+				once.Do(func() {
+					if len(hostCount) == 1 {
+						return
+					}
+					logger.Info(" * Set %v:", i+1)
+					for j := 0; j < setDriveCount; j++ {
+						disk := storageDisks[i*setDriveCount+j]
+						logger.Info("   - Drive: %s", disk.String())
+					}
+				})
+				logger.Info(color.Yellow("WARNING:")+" Host %v has more than %v drives of set. "+
+					"A host failure will result in data becoming unavailable.", host, wantAtMost)
 			}
 		}
 	}
@@ -809,13 +794,12 @@ func initFormatErasure(ctx context.Context, storageDisks []StorageAPI, setCount,
 
 // ecDrivesNoConfig returns the erasure coded drives in a set if no config has been set.
 // It will attempt to read it from env variable and fall back to drives/2.
-func ecDrivesNoConfig(setDriveCount int) int {
-	sc, _ := storageclass.LookupConfig(config.KVS{}, setDriveCount)
-	ecDrives := sc.GetParityForSC(storageclass.STANDARD)
-	if ecDrives < 0 {
-		ecDrives = storageclass.DefaultParityBlocks(setDriveCount)
+func ecDrivesNoConfig(setDriveCount int) (int, error) {
+	sc, err := storageclass.LookupConfig(config.KVS{}, setDriveCount)
+	if err != nil {
+		return 0, err
 	}
-	return ecDrives
+	return sc.GetParityForSC(storageclass.STANDARD), nil
 }
 
 // Make Erasure backend meta volumes.

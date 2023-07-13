@@ -55,7 +55,7 @@ func (e metaCacheEntry) isObject() bool {
 	return len(e.metadata) > 0
 }
 
-// isObjectDir returns if the entry is representing an object__XL_DIR__
+// isObjectDir returns if the entry is representing an object/
 func (e metaCacheEntry) isObjectDir() bool {
 	return len(e.metadata) > 0 && strings.HasSuffix(e.name, slashSeparator)
 }
@@ -189,6 +189,43 @@ func (e *metaCacheEntry) isLatestDeletemarker() bool {
 	return xlMeta.versions[0].header.Type == DeleteType
 }
 
+// isAllFreeVersions returns if all objects are free versions.
+// If metadata is NOT versioned false will always be returned.
+// If v2 and UNABLE to load metadata true will be returned.
+func (e *metaCacheEntry) isAllFreeVersions() bool {
+	if e.cached != nil {
+		if len(e.cached.versions) == 0 {
+			return true
+		}
+		for _, v := range e.cached.versions {
+			if !v.header.FreeVersion() {
+				return false
+			}
+		}
+		return true
+	}
+	if !isXL2V1Format(e.metadata) {
+		return false
+	}
+	if meta, _, err := isIndexedMetaV2(e.metadata); meta != nil {
+		return meta.AllHidden(false)
+	} else if err != nil {
+		return true
+	}
+	// Fall back...
+	xlMeta, err := e.xlmeta()
+	if err != nil || len(xlMeta.versions) == 0 {
+		return true
+	}
+	// Check versions..
+	for _, v := range e.cached.versions {
+		if !v.header.FreeVersion() {
+			return false
+		}
+	}
+	return true
+}
+
 // fileInfo returns the decoded metadata.
 // If entry is a directory it is returned as that.
 // If versioned the latest version will be returned.
@@ -211,7 +248,7 @@ func (e *metaCacheEntry) fileInfo(bucket string) (FileInfo, error) {
 				ModTime:  timeSentinel1970,
 			}, nil
 		}
-		return e.cached.ToFileInfo(bucket, e.name, "")
+		return e.cached.ToFileInfo(bucket, e.name, "", false)
 	}
 	return getFileInfo(e.metadata, bucket, e.name, "", false)
 }
@@ -621,7 +658,7 @@ func (m *metaCacheEntriesSorted) forwardPast(s string) {
 // The entry not chosen will be discarded.
 // If the context is canceled the function will return the error,
 // otherwise the function will return nil.
-func mergeEntryChannels(ctx context.Context, in []chan metaCacheEntry, out chan<- metaCacheEntry, compareMeta func(existing, other *metaCacheEntry) (replace bool)) error {
+func mergeEntryChannels(ctx context.Context, in []chan metaCacheEntry, out chan<- metaCacheEntry, readQuorum int) error {
 	defer close(out)
 	top := make([]*metaCacheEntry, len(in))
 	nDone := 0
@@ -667,6 +704,7 @@ func mergeEntryChannels(ctx context.Context, in []chan metaCacheEntry, out chan<
 		}
 	}
 	last := ""
+	var toMerge []int
 
 	// Choose the best to return.
 	for {
@@ -675,6 +713,7 @@ func mergeEntryChannels(ctx context.Context, in []chan metaCacheEntry, out chan<
 		}
 		best := top[0]
 		bestIdx := 0
+		toMerge = toMerge[:0]
 		for i, other := range top[1:] {
 			otherIdx := i + 1
 			if other == nil {
@@ -693,23 +732,63 @@ func mergeEntryChannels(ctx context.Context, in []chan metaCacheEntry, out chan<
 			// we compare the `foo-1/` after path.Clean() to
 			// de-dup the entries.
 			if path.Clean(best.name) == path.Clean(other.name) {
-				if compareMeta(best, other) {
-					// Replace "best"
-					if err := selectFrom(bestIdx); err != nil {
-						return err
-					}
-					best = other
-					bestIdx = otherIdx
-				} else if err := selectFrom(otherIdx); err != nil {
-					// Keep best, replace "other"
-					return err
-				}
+				toMerge = append(toMerge, otherIdx)
 				continue
 			}
 			if best.name > other.name {
+				toMerge = toMerge[:0]
 				best = other
 				bestIdx = otherIdx
 			}
+		}
+
+		// Merge any unmerged
+		if len(toMerge) > 0 {
+			versions := make([]xlMetaV2ShallowVersion, 0, len(toMerge)+1)
+			xl, err := best.xlmeta()
+			if err == nil {
+				versions = append(versions, xl.versions...)
+			}
+			for _, idx := range toMerge {
+				other := top[idx]
+				if other == nil {
+					continue
+				}
+				xl2, err := other.xlmeta()
+				if err != nil {
+					if err := selectFrom(idx); err != nil {
+						return err
+					}
+					continue
+				}
+				if xl == nil {
+					// Discard current "best"
+					if err := selectFrom(bestIdx); err != nil {
+						return err
+					}
+					bestIdx = idx
+					best = other
+					xl = xl2
+				} else {
+					// Mark read, unless we added it as new "best".
+					if err := selectFrom(idx); err != nil {
+						return err
+					}
+				}
+				versions = append(versions, xl2.versions...)
+			}
+			if xl != nil && len(versions) > 0 {
+				// Merge all versions. 'strict' doesn't matter since we only need one.
+				xl.versions = mergeXLV2Versions(readQuorum, true, 0, versions)
+				if meta, err := xl.AppendTo(metaDataPoolGet()); err == nil {
+					if best.reusable {
+						metaDataPoolPut(best.metadata)
+					}
+					best.metadata = meta
+					best.cached = xl
+				}
+			}
+			toMerge = toMerge[:0]
 		}
 		if best.name > last {
 			select {
@@ -737,15 +816,16 @@ func (m *metaCacheEntriesSorted) merge(other metaCacheEntriesSorted, limit int) 
 	a := m.entries()
 	b := other.entries()
 	for len(a) > 0 && len(b) > 0 {
-		if a[0].name == b[0].name && bytes.Equal(a[0].metadata, b[0].metadata) {
+		switch {
+		case a[0].name == b[0].name && bytes.Equal(a[0].metadata, b[0].metadata):
 			// Same, discard one.
 			merged = append(merged, a[0])
 			a = a[1:]
 			b = b[1:]
-		} else if a[0].name < b[0].name {
+		case a[0].name < b[0].name:
 			merged = append(merged, a[0])
 			a = a[1:]
-		} else {
+		default:
 			merged = append(merged, b[0])
 			b = b[1:]
 		}

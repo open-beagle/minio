@@ -19,10 +19,14 @@ package cmd
 
 import (
 	"context"
+	"fmt"
 	"runtime"
+	"strconv"
+	"time"
 
-	"github.com/minio/madmin-go"
-	"github.com/minio/minio/internal/pubsub"
+	"github.com/minio/madmin-go/v3"
+	"github.com/minio/minio/internal/logger"
+	"github.com/minio/pkg/env"
 )
 
 // healTask represents what to heal along with options
@@ -54,16 +58,46 @@ type healRoutine struct {
 func activeListeners() int {
 	// Bucket notification and http trace are not costly, it is okay to ignore them
 	// while counting the number of concurrent connections
-	return int(globalHTTPListen.NumSubscribers(pubsub.MaskAll)) + int(globalTrace.NumSubscribers(pubsub.MaskAll))
+	return int(globalHTTPListen.Subscribers()) + int(globalTrace.Subscribers())
+}
+
+func waitForLowIO(maxIO int, maxWait time.Duration, currentIO func() int) {
+	// No need to wait run at full speed.
+	if maxIO <= 0 {
+		return
+	}
+
+	const waitTick = 100 * time.Millisecond
+
+	tmpMaxWait := maxWait
+
+	for currentIO() >= maxIO {
+		if tmpMaxWait > 0 {
+			if tmpMaxWait < waitTick {
+				time.Sleep(tmpMaxWait)
+			} else {
+				time.Sleep(waitTick)
+			}
+			tmpMaxWait -= waitTick
+		}
+		if tmpMaxWait <= 0 {
+			return
+		}
+	}
+}
+
+func currentHTTPIO() int {
+	httpServer := newHTTPServerFn()
+	if httpServer == nil {
+		return 0
+	}
+
+	return httpServer.GetRequestCount() - activeListeners()
 }
 
 func waitForLowHTTPReq() {
-	var currentIO func() int
-	if httpServer := newHTTPServerFn(); httpServer != nil {
-		currentIO = httpServer.GetRequestCount
-	}
-
-	globalHealConfig.Wait(currentIO, activeListeners)
+	maxIO, maxWait, _ := globalHealConfig.Clone()
+	waitForLowIO(maxIO, maxWait, currentHTTPIO)
 }
 
 func initBackgroundHealing(ctx context.Context, objAPI ObjectLayer) {
@@ -89,8 +123,7 @@ func (h *healRoutine) AddWorker(ctx context.Context, objAPI ObjectLayer) {
 			var err error
 			switch task.bucket {
 			case nopHeal:
-				task.respCh <- healResult{err: errSkipFile}
-				continue
+				err = errSkipFile
 			case SlashSeparator:
 				res, err = healDiskFormat(ctx, objAPI, task.opts)
 			default:
@@ -101,7 +134,10 @@ func (h *healRoutine) AddWorker(ctx context.Context, objAPI ObjectLayer) {
 				}
 			}
 
-			task.respCh <- healResult{result: res, err: err}
+			if task.respCh != nil {
+				task.respCh <- healResult{result: res, err: err}
+			}
+
 		case <-ctx.Done():
 			return
 		}
@@ -110,9 +146,19 @@ func (h *healRoutine) AddWorker(ctx context.Context, objAPI ObjectLayer) {
 
 func newHealRoutine() *healRoutine {
 	workers := runtime.GOMAXPROCS(0) / 2
+
+	if envHealWorkers := env.Get("_MINIO_HEAL_WORKERS", ""); envHealWorkers != "" {
+		if numHealers, err := strconv.Atoi(envHealWorkers); err != nil {
+			logger.LogIf(context.Background(), fmt.Errorf("invalid _MINIO_HEAL_WORKERS value: %w", err))
+		} else {
+			workers = numHealers
+		}
+	}
+
 	if workers == 0 {
 		workers = 4
 	}
+
 	return &healRoutine{
 		tasks:   make(chan healTask),
 		workers: workers,

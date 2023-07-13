@@ -29,10 +29,10 @@ import (
 	"time"
 
 	"github.com/minio/highwayhash"
-	"github.com/minio/madmin-go"
+	"github.com/minio/madmin-go/v3"
 	"github.com/minio/minio-go/v7/pkg/set"
 	xhttp "github.com/minio/minio/internal/http"
-	"github.com/minio/minio/internal/logger/message/log"
+	"github.com/minio/pkg/logger/message/log"
 )
 
 // HighwayHash key for logging in anonymous mode
@@ -63,7 +63,6 @@ const TimeFormat string = "15:04:05 MST 01/02/2006"
 var matchingFuncNames = [...]string{
 	"http.HandlerFunc.ServeHTTP",
 	"cmd.serverMain",
-	"cmd.StartGateway",
 	// add more here ..
 }
 
@@ -232,8 +231,8 @@ func getTrace(traceLevel int) []string {
 	return trace
 }
 
-// Return the highway hash of the passed string
-func hashString(input string) string {
+// HashString - return the highway hash of the passed string
+func HashString(input string) string {
 	hh, _ := highwayhash.New(magicHighwayHash256Key)
 	hh.Write([]byte(input))
 	return hex.EncodeToString(hh.Sum(nil))
@@ -279,9 +278,9 @@ func errToEntry(ctx context.Context, err error, errKind ...interface{}) log.Entr
 		API = req.API
 	}
 
-	kv := req.GetTags()
-	tags := make(map[string]interface{}, len(kv))
-	for _, entry := range kv {
+	// Copy tags. We hold read lock already.
+	tags := make(map[string]interface{}, len(req.tags))
+	for _, entry := range req.tags {
 		tags[entry.Key] = entry.Val
 	}
 
@@ -290,8 +289,9 @@ func errToEntry(ctx context.Context, err error, errKind ...interface{}) log.Entr
 
 	// Get the cause for the Error
 	message := fmt.Sprintf("%v (%T)", err, err)
+	deploymentID := req.DeploymentID
 	if req.DeploymentID == "" {
-		req.DeploymentID = xhttp.GlobalDeploymentID
+		deploymentID = xhttp.GlobalDeploymentID
 	}
 
 	objects := make([]log.ObjectVersion, 0, len(req.Objects))
@@ -303,7 +303,7 @@ func errToEntry(ctx context.Context, err error, errKind ...interface{}) log.Entr
 	}
 
 	entry := log.Entry{
-		DeploymentID: req.DeploymentID,
+		DeploymentID: deploymentID,
 		Level:        ErrorLvl.String(),
 		LogKind:      logKind,
 		RemoteHost:   req.RemoteHost,
@@ -328,9 +328,9 @@ func errToEntry(ctx context.Context, err error, errKind ...interface{}) log.Entr
 	}
 
 	if anonFlag {
-		entry.API.Args.Bucket = hashString(entry.API.Args.Bucket)
-		entry.API.Args.Object = hashString(entry.API.Args.Object)
-		entry.RemoteHost = hashString(entry.RemoteHost)
+		entry.API.Args.Bucket = HashString(entry.API.Args.Bucket)
+		entry.API.Args.Object = HashString(entry.API.Args.Object)
+		entry.RemoteHost = HashString(entry.RemoteHost)
 		entry.Trace.Message = reflect.TypeOf(err).String()
 		entry.Trace.Variables = make(map[string]interface{})
 	}
@@ -347,7 +347,7 @@ func consoleLogIf(ctx context.Context, err error, errKind ...interface{}) {
 
 	if consoleTgt != nil {
 		entry := errToEntry(ctx, err, errKind...)
-		consoleTgt.Send(entry)
+		consoleTgt.Send(ctx, entry)
 	}
 }
 
@@ -366,10 +366,10 @@ func logIf(ctx context.Context, err error, errKind ...interface{}) {
 	entry := errToEntry(ctx, err, errKind...)
 	// Iterate over all logger targets to send the log entry
 	for _, t := range systemTgts {
-		if err := t.Send(entry); err != nil {
+		if err := t.Send(ctx, entry); err != nil {
 			if consoleTgt != nil {
 				entry.Trace.Message = fmt.Sprintf("event(%#v) was not sent to Logger target (%#v): %#v", entry, t, err)
-				consoleTgt.Send(entry)
+				consoleTgt.Send(ctx, entry)
 			}
 		}
 	}

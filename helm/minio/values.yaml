@@ -14,7 +14,7 @@ clusterDomain: cluster.local
 ##
 image:
   repository: quay.io/minio/minio
-  tag: RELEASE.2022-09-17T00-09-45Z
+  tag: RELEASE.2023-07-07T07-13-57Z
   pullPolicy: IfNotPresent
 
 imagePullSecrets: []
@@ -25,11 +25,11 @@ imagePullSecrets: []
 ##
 mcImage:
   repository: quay.io/minio/mc
-  tag: RELEASE.2022-09-16T09-16-47Z
+  tag: RELEASE.2023-06-28T21-54-17Z
   pullPolicy: IfNotPresent
 
-## minio mode, i.e. standalone or distributed or gateway.
-mode: distributed ## other supported values are "standalone", "gateway"
+## minio mode, i.e. standalone or distributed
+mode: distributed ## other supported values are "standalone"
 
 ## Additional labels to include with deployment or statefulset
 additionalLabels: {}
@@ -52,6 +52,9 @@ extraVolumes: []
 ## Additional volumeMounts to minio container
 extraVolumeMounts: []
 
+## Additional sidecar containers
+extraContainers: []
+
 ## Internal port number for MinIO S3 API container
 ## Change service.port to change external port number
 minioAPIPort: "9000"
@@ -61,13 +64,13 @@ minioAPIPort: "9000"
 minioConsolePort: "9001"
 
 ## Update strategy for Deployments
-DeploymentUpdate:
+deploymentUpdate:
   type: RollingUpdate
   maxUnavailable: 0
   maxSurge: 100%
 
 ## Update strategy for StatefulSets
-StatefulSetUpdate:
+statefulSetUpdate:
   updateStrategy: RollingUpdate
 
 ## Pod priority settings
@@ -118,11 +121,6 @@ replicas: 16
 # Number of expanded MinIO clusters
 pools: 1
 
-# Deploy if 'mode == gateway' - 4 replicas.
-gateway:
-  type: "nas" # currently only "nas" are supported.
-  replicas: 4
-
 ## TLS Settings for MinIO
 tls:
   enabled: false
@@ -159,7 +157,7 @@ persistence:
   ## Storage class of PV to bind. By default it looks for standard storage class.
   ## If the PV uses a different storage class, specify that here.
   storageClass: ""
-  VolumeName: ""
+  volumeName: ""
   accessMode: ReadWriteOnce
   size: 500Gi
 
@@ -177,16 +175,18 @@ service:
   clusterIP: ~
   port: "9000"
   nodePort: 32000
+  loadBalancerIP: ~
+  externalIPs: []
+  annotations: {}
 
 ## Configure Ingress based on the documentation here: https://kubernetes.io/docs/concepts/services-networking/ingress/
 ##
 
 ingress:
   enabled: false
-  # ingressClassName: ""
+  ingressClassName: ~
   labels: {}
     # node-role.kubernetes.io/ingress: platform
-
   annotations: {}
     # kubernetes.io/ingress.class: nginx
     # kubernetes.io/tls-acme: "true"
@@ -208,13 +208,15 @@ consoleService:
   clusterIP: ~
   port: "9001"
   nodePort: 32001
+  loadBalancerIP: ~
+  externalIPs: []
+  annotations: {}
 
 consoleIngress:
   enabled: false
-  # ingressClassName: ""
+  ingressClassName: ~
   labels: {}
     # node-role.kubernetes.io/ingress: platform
-
   annotations: {}
     # kubernetes.io/ingress.class: nginx
     # kubernetes.io/tls-acme: "true"
@@ -318,21 +320,13 @@ policies: []
 #
 ## Additional Annotations for the Kubernetes Job makePolicyJob
 makePolicyJob:
-  podAnnotations: {}
-  annotations: {}
   securityContext:
     enabled: false
     runAsUser: 1000
     runAsGroup: 1000
-    fsGroup: 1000
   resources:
     requests:
       memory: 128Mi
-  nodeSelector: {}
-  tolerations: []
-  affinity: {}
-  extraVolumes: []
-  extraVolumeMounts: []
   # Command to run after the main command on exit
   exitCommand: ""
 
@@ -353,30 +347,60 @@ users:
   #  existingSecretKey: password
   #  policy: readonly
 
-
 ## Additional Annotations for the Kubernetes Job makeUserJob
 makeUserJob:
-  podAnnotations: {}
-  annotations: {}
   securityContext:
     enabled: false
     runAsUser: 1000
     runAsGroup: 1000
-    fsGroup: 1000
   resources:
     requests:
       memory: 128Mi
-  nodeSelector: {}
-  tolerations: []
-  affinity: {}
-  extraVolumes: []
-  extraVolumeMounts: []
+  # Command to run after the main command on exit
+  exitCommand: ""
+
+## List of service accounts to be created after minio install
+##
+svcaccts: []
+  ## accessKey, secretKey and parent user to be assigned to the service accounts
+  ## Add new service accounts as explained here https://min.io/docs/minio/kubernetes/upstream/administration/identity-access-management/minio-user-management.html#service-accounts
+  # - accessKey: console-svcacct
+  #   secretKey: console123
+  #   user: console
+  ## Or you can refer to specific secret
+  # - accessKey: externalSecret
+  #   existingSecret: my-secret
+  #   existingSecretKey: password
+  #   user: console
+  ## You also can pass custom policy
+  # - accessKey: console-svcacct
+  #   secretKey: console123
+  #   user: console
+  #   policy:
+  #     statements:
+  #       - resources:
+  #           - 'arn:aws:s3:::example*/*'
+  #         actions:
+  #           - "s3:AbortMultipartUpload"
+  #           - "s3:GetObject"
+  #           - "s3:DeleteObject"
+  #           - "s3:PutObject"
+  #           - "s3:ListMultipartUploadParts"
+
+makeServiceAccountJob:
+  securityContext:
+    enabled: false
+    runAsUser: 1000
+    runAsGroup: 1000
+  resources:
+    requests:
+      memory: 128Mi
   # Command to run after the main command on exit
   exitCommand: ""
 
 ## List of buckets to be created after minio install
 ##
-buckets:
+buckets: []
   #   # Name of the bucket
   # - name: bucket1
   #   # Policy to be set on the
@@ -388,43 +412,47 @@ buckets:
   #   # bucket [true|false]
   #   versioning: false
   #   # set objectlocking for
-  #   # bucket [true|false] NOTE: versioning is enabled by default if you use locking 
+  #   # bucket [true|false] NOTE: versioning is enabled by default if you use locking
   #   objectlocking: false
   # - name: bucket2
   #   policy: none
   #   purge: false
   #   versioning: true
   #   # set objectlocking for
-  #   # bucket [true|false] NOTE: versioning is enabled by default if you use locking 
+  #   # bucket [true|false] NOTE: versioning is enabled by default if you use locking
   #   objectlocking: false
 
 ## Additional Annotations for the Kubernetes Job makeBucketJob
 makeBucketJob:
-  podAnnotations: {}
-  annotations: {}
   securityContext:
     enabled: false
     runAsUser: 1000
     runAsGroup: 1000
-    fsGroup: 1000
   resources:
     requests:
       memory: 128Mi
-  nodeSelector: {}
-  tolerations: []
-  affinity: {}
-  extraVolumes: []
-  extraVolumeMounts: []
   # Command to run after the main command on exit
   exitCommand: ""
-  
+
 ## List of command to run after minio install
 ## NOTE: the mc command TARGET is always "myminio"
 customCommands:
-  # - command: "admin policy set myminio consoleAdmin group='cn=ops,cn=groups,dc=example,dc=com'"
+  # - command: "admin policy attach myminio consoleAdmin --group='cn=ops,cn=groups,dc=example,dc=com'"
 
 ## Additional Annotations for the Kubernetes Job customCommandJob
 customCommandJob:
+  securityContext:
+    enabled: false
+    runAsUser: 1000
+    runAsGroup: 1000
+  resources:
+    requests:
+      memory: 128Mi
+  # Command to run after the main command on exit
+  exitCommand: ""
+
+## Merge jobs
+postJob:
   podAnnotations: {}
   annotations: {}
   securityContext:
@@ -432,15 +460,10 @@ customCommandJob:
     runAsUser: 1000
     runAsGroup: 1000
     fsGroup: 1000
-  resources:
-    requests:
-      memory: 128Mi
   nodeSelector: {}
   tolerations: []
   affinity: {}
-  # Command to run after the main command on exit
-  exitCommand: ""
-  
+
 ## Use this field to add environment variables relevant to MinIO server. These fields will be passed on to MinIO container(s)
 ## when Chart is deployed
 environment:
@@ -452,7 +475,7 @@ environment:
 ## This can be useful for LDAP password, etc
 ## The key in the secret must be 'config.env'
 ##
-# extraSecret: minio-extraenv
+extraSecret: ~
 
 ## OpenID Identity Management
 ## The following section documents environment variables for enabling external identity management using an OpenID Connect (OIDC)-compatible provider.
@@ -492,9 +515,10 @@ metrics:
   serviceMonitor:
     enabled: false
     # scrape each node/pod individually for additional metrics
-    includeNode: false 
+    includeNode: false
     public: true
     additionalLabels: {}
+    annotations: {}
     # for node metrics
     relabelConfigs: {}
     # for cluster metrics
@@ -502,9 +526,11 @@ metrics:
       # metricRelabelings:
       #   - regex: (server|pod)
       #     action: labeldrop
-    # namespace: monitoring
-    # interval: 30s
-    # scrapeTimeout: 10s
+    namespace: ~
+    # Scrape interval, for example `interval: 30s`
+    interval: ~
+    # Scrape timeout, for example `scrapeTimeout: 10s`
+    scrapeTimeout: ~
 
 ## ETCD settings: https://github.com/minio/minio/blob/master/docs/sts/etcd.md
 ## Define endpoints to enable this section.

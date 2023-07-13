@@ -25,25 +25,51 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/minio/madmin-go"
+	"github.com/minio/madmin-go/v3"
 	"github.com/minio/minio-go/v7/pkg/set"
 	"github.com/minio/minio/internal/auth"
 	"github.com/minio/pkg/env"
 )
 
-// Error config error type
-type Error struct {
-	Err string
+// ErrorConfig holds the config error types
+type ErrorConfig interface {
+	ErrConfigGeneric | ErrConfigNotFound
 }
 
-// Errorf - formats according to a format specifier and returns
-// the string as a value that satisfies error of type config.Error
-func Errorf(format string, a ...interface{}) error {
-	return Error{Err: fmt.Sprintf(format, a...)}
+// ErrConfigGeneric is a generic config type
+type ErrConfigGeneric struct {
+	msg string
 }
 
-func (e Error) Error() string {
-	return e.Err
+func (ge *ErrConfigGeneric) setMsg(msg string) {
+	ge.msg = msg
+}
+
+func (ge ErrConfigGeneric) Error() string {
+	return ge.msg
+}
+
+// ErrConfigNotFound is an error to indicate
+// that a config parameter is not found
+type ErrConfigNotFound struct {
+	ErrConfigGeneric
+}
+
+// Error creates an error message and wraps
+// it with the error type specified in the type parameter
+func Error[T ErrorConfig, PT interface {
+	*T
+	setMsg(string)
+}](format string, vals ...interface{},
+) T {
+	pt := PT(new(T))
+	pt.setMsg(fmt.Sprintf(format, vals...))
+	return *pt
+}
+
+// Errorf formats an error and returns it as a generic config error
+func Errorf(format string, vals ...interface{}) ErrConfigGeneric {
+	return Error[ErrConfigGeneric](format, vals...)
 }
 
 // Default keys
@@ -70,7 +96,6 @@ const (
 
 // Top level config constants.
 const (
-	CredentialsSubSys    = madmin.CredentialsSubSys
 	PolicyOPASubSys      = madmin.PolicyOPASubSys
 	PolicyPluginSubSys   = madmin.PolicyPluginSubSys
 	IdentityOpenIDSubSys = madmin.IdentityOpenIDSubSys
@@ -112,6 +137,11 @@ const (
 	// Add new constants here (similar to above) if you add new fields to config.
 )
 
+// Lambda config constants.
+const (
+	LambdaWebhookSubSys = madmin.LambdaWebhookSubSys
+)
+
 // NotifySubSystems - all notification sub-systems
 var NotifySubSystems = set.CreateStringSet(
 	NotifyKafkaSubSys,
@@ -124,6 +154,11 @@ var NotifySubSystems = set.CreateStringSet(
 	NotifyPostgresSubSys,
 	NotifyRedisSubSys,
 	NotifyWebhookSubSys,
+)
+
+// LambdaSubSystems - all lambda sub-systesm
+var LambdaSubSystems = set.CreateStringSet(
+	LambdaWebhookSubSys,
 )
 
 // LoggerSubSystems - all sub-systems related to logger
@@ -152,7 +187,6 @@ var SubSystemsDynamic = set.CreateStringSet(
 
 // SubSystemsSingleTargets - subsystems which only support single target.
 var SubSystemsSingleTargets = set.CreateStringSet(
-	CredentialsSubSys,
 	SiteSubSys,
 	RegionSubSys,
 	EtcdSubSys,
@@ -187,13 +221,12 @@ const (
 )
 
 // DefaultKVS - default kvs for all sub-systems
-var DefaultKVS map[string]KVS
+var DefaultKVS = map[string]KVS{}
 
 // RegisterDefaultKVS - this function saves input kvsMap
 // globally, this should be called only once preferably
 // during `init()`.
 func RegisterDefaultKVS(kvsMap map[string]KVS) {
-	DefaultKVS = map[string]KVS{}
 	for subSys, kvs := range kvsMap {
 		DefaultKVS[subSys] = kvs
 	}
@@ -202,14 +235,13 @@ func RegisterDefaultKVS(kvsMap map[string]KVS) {
 // HelpSubSysMap - help for all individual KVS for each sub-systems
 // also carries a special empty sub-system which dumps
 // help for each sub-system key.
-var HelpSubSysMap map[string]HelpKVS
+var HelpSubSysMap = map[string]HelpKVS{}
 
 // RegisterHelpSubSys - this function saves
 // input help KVS for each sub-system globally,
 // this function should be called only once
 // preferably in during `init()`.
 func RegisterHelpSubSys(helpKVSMap map[string]HelpKVS) {
-	HelpSubSysMap = map[string]HelpKVS{}
 	for subSys, hkvs := range helpKVSMap {
 		HelpSubSysMap[subSys] = hkvs
 	}
@@ -217,12 +249,11 @@ func RegisterHelpSubSys(helpKVSMap map[string]HelpKVS) {
 
 // HelpDeprecatedSubSysMap - help for all deprecated sub-systems, that may be
 // removed in the future.
-var HelpDeprecatedSubSysMap map[string]HelpKV
+var HelpDeprecatedSubSysMap = map[string]HelpKV{}
 
 // RegisterHelpDeprecatedSubSys - saves input help KVS for deprecated
 // sub-systems globally. Should be called only once at init.
 func RegisterHelpDeprecatedSubSys(helpDeprecatedKVMap map[string]HelpKV) {
-	HelpDeprecatedSubSysMap = map[string]HelpKV{}
 	for k, v := range helpDeprecatedKVMap {
 		HelpDeprecatedSubSysMap[k] = v
 	}
@@ -232,6 +263,23 @@ func RegisterHelpDeprecatedSubSys(helpDeprecatedKVMap map[string]HelpKV) {
 type KV struct {
 	Key   string `json:"key"`
 	Value string `json:"value"`
+
+	Deprecated bool `json:"-"`
+}
+
+func (kv KV) String() string {
+	var s strings.Builder
+	s.WriteString(kv.Key)
+	s.WriteString(KvSeparator)
+	spc := madmin.HasSpace(kv.Value)
+	if spc {
+		s.WriteString(KvDoubleQuote)
+	}
+	s.WriteString(kv.Value)
+	if spc {
+		s.WriteString(KvDoubleQuote)
+	}
+	return s.String()
 }
 
 // KVS - is a shorthand for some wrapper functions
@@ -277,20 +325,7 @@ func (kvs KVS) Keys() []string {
 func (kvs KVS) String() string {
 	var s strings.Builder
 	for _, kv := range kvs {
-		// Do not need to print if state is on
-		if kv.Key == Enable && kv.Value == EnableOn {
-			continue
-		}
-		s.WriteString(kv.Key)
-		s.WriteString(KvSeparator)
-		spc := madmin.HasSpace(kv.Value)
-		if spc {
-			s.WriteString(KvDoubleQuote)
-		}
-		s.WriteString(kv.Value)
-		if spc {
-			s.WriteString(KvDoubleQuote)
-		}
+		s.WriteString(kv.String())
 		s.WriteString(KvSpaceSeparator)
 	}
 	return s.String()
@@ -349,6 +384,16 @@ func (kvs *KVS) Delete(key string) {
 	}
 }
 
+// LookupKV returns the KV by its key
+func (kvs KVS) LookupKV(key string) (KV, bool) {
+	for _, kv := range kvs {
+		if kv.Key == key {
+			return kv, true
+		}
+	}
+	return KV{}, false
+}
+
 // Lookup - lookup a key in a list of KVS
 func (kvs KVS) Lookup(key string) (string, bool) {
 	for _, kv := range kvs {
@@ -376,6 +421,34 @@ func (c Config) DelFrom(r io.Reader) error {
 		}
 	}
 	return scanner.Err()
+}
+
+// ContextKeyString is type(string) for contextKey
+type ContextKeyString string
+
+// ContextKeyForTargetFromConfig - key for context for target from config
+const ContextKeyForTargetFromConfig = ContextKeyString("ContextKeyForTargetFromConfig")
+
+// ParseConfigTargetID - read all targetIDs from reader
+func ParseConfigTargetID(r io.Reader) (ids map[string]bool, err error) {
+	ids = make(map[string]bool)
+	scanner := bufio.NewScanner(r)
+	for scanner.Scan() {
+		// Skip any empty lines, or comment like characters
+		text := scanner.Text()
+		if text == "" || strings.HasPrefix(text, KvComment) {
+			continue
+		}
+		_, _, tgt, err := GetSubSys(text)
+		if err != nil {
+			return nil, err
+		}
+		ids[tgt] = true
+	}
+	if err := scanner.Err(); err != nil {
+		return nil, err
+	}
+	return
 }
 
 // ReadConfig - read content from input and write into c.
@@ -423,43 +496,7 @@ func (c Config) RedactSensitiveInfo() Config {
 		}
 	}
 
-	// Remove the server credentials altogether
-	nc.DelKVS(CredentialsSubSys)
-
 	return nc
-}
-
-type configWriteTo struct {
-	Config
-	filterByKey string
-}
-
-// NewConfigWriteTo - returns a struct which
-// allows for serializing the config/kv struct
-// to a io.WriterTo
-func NewConfigWriteTo(cfg Config, key string) io.WriterTo {
-	return &configWriteTo{Config: cfg, filterByKey: key}
-}
-
-// WriteTo - implements io.WriterTo interface implementation for config.
-func (c *configWriteTo) WriteTo(w io.Writer) (int64, error) {
-	kvsTargets, err := c.GetKVS(c.filterByKey, DefaultKVS)
-	if err != nil {
-		return 0, err
-	}
-	var n int
-	for _, target := range kvsTargets {
-		m1, _ := w.Write([]byte(target.SubSystem))
-		m2, _ := w.Write([]byte(KvSpaceSeparator))
-		m3, _ := w.Write([]byte(target.KVS.String()))
-		if len(kvsTargets) > 1 {
-			m4, _ := w.Write([]byte(KvNewline))
-			n += m1 + m2 + m3 + m4
-		} else {
-			n += m1 + m2 + m3
-		}
-	}
-	return int64(n), nil
 }
 
 // Default KV configs for worm and region
@@ -493,20 +530,6 @@ var (
 		},
 	}
 )
-
-// LookupCreds - lookup credentials from config.
-func LookupCreds(kv KVS) (auth.Credentials, error) {
-	if err := CheckValidKeys(CredentialsSubSys, kv, DefaultCredentialKVS); err != nil {
-		return auth.Credentials{}, err
-	}
-	accessKey := kv.Get(AccessKey)
-	secretKey := kv.Get(SecretKey)
-	if accessKey == "" || secretKey == "" {
-		accessKey = auth.DefaultAccessKey
-		secretKey = auth.DefaultSecretKey
-	}
-	return auth.CreateCredentials(accessKey, secretKey)
-}
 
 // Site - holds site info - name and region.
 type Site struct {
@@ -572,13 +595,23 @@ func LookupSite(siteKV KVS, regionKV KVS) (s Site, err error) {
 
 // CheckValidKeys - checks if inputs KVS has the necessary keys,
 // returns error if it find extra or superflous keys.
-func CheckValidKeys(subSys string, kv KVS, validKVS KVS) error {
+func CheckValidKeys(subSys string, kv KVS, validKVS KVS, deprecatedKeys ...string) error {
 	nkv := KVS{}
 	for _, kv := range kv {
 		// Comment is a valid key, its also fully optional
 		// ignore it since it is a valid key for all
 		// sub-systems.
 		if kv.Key == Comment {
+			continue
+		}
+		var skip bool
+		for _, deprecatedKey := range deprecatedKeys {
+			if kv.Key == deprecatedKey {
+				skip = true
+				break
+			}
+		}
+		if skip {
 			continue
 		}
 		if _, ok := validKVS.Lookup(kv.Key); !ok {
@@ -602,6 +635,17 @@ func LookupWorm() (bool, error) {
 var renamedSubsys = map[string]string{
 	CrawlerSubSys: ScannerSubSys,
 	// Add future sub-system renames
+}
+
+const ( // deprecated keys
+	apiReplicationWorkers       = "replication_workers"
+	apiReplicationFailedWorkers = "replication_failed_workers"
+)
+
+// map of subsystem to deleted keys
+var deletedSubSysKeys = map[string][]string{
+	APISubSys: {apiReplicationWorkers, apiReplicationFailedWorkers},
+	// Add future sub-system deleted keys
 }
 
 // Merge - merges a new config with all the
@@ -634,9 +678,16 @@ func (c Config) Merge() Config {
 				}
 				subSys = rnSubSys
 			}
+			// Delete deprecated keys for subsystem if any
+			if keys, ok := deletedSubSysKeys[subSys]; ok {
+				for _, key := range keys {
+					ckvs.Delete(key)
+				}
+			}
 			cp[subSys][tgt] = ckvs
 		}
 	}
+
 	return cp
 }
 
@@ -758,7 +809,7 @@ func (c Config) DelKVS(s string) error {
 
 	ck, ok := c[subSys][tgt]
 	if !ok {
-		return Errorf("sub-system %s:%s already deleted or does not exist", subSys, tgt)
+		return Error[ErrConfigNotFound]("sub-system %s:%s already deleted or does not exist", subSys, tgt)
 	}
 
 	if len(inputs) == 2 {
@@ -767,7 +818,7 @@ func (c Config) DelKVS(s string) error {
 		for _, delKey := range strings.Fields(inputs[1]) {
 			_, ok := currKVS.Lookup(delKey)
 			if !ok {
-				return Errorf("key %s doesn't exist", delKey)
+				return Error[ErrConfigNotFound]("key %s doesn't exist", delKey)
 			}
 			defVal, isDef := defKVS.Lookup(delKey)
 			if isDef {
@@ -1069,7 +1120,7 @@ func getEnvVarName(subSys, target, param string) string {
 		Default, target)
 }
 
-var resolvableSubsystems = set.CreateStringSet(IdentityOpenIDSubSys, IdentityLDAPSubSys)
+var resolvableSubsystems = set.CreateStringSet(IdentityOpenIDSubSys, IdentityLDAPSubSys, PolicyPluginSubSys)
 
 // ValueSource represents the source of a config parameter value.
 type ValueSource uint8
@@ -1093,7 +1144,11 @@ const (
 // This function only works for a subset of sub-systems, others return
 // `ValueSourceAbsent`. FIXME: some parameters have custom environment
 // variables for which support needs to be added.
-func (c Config) ResolveConfigParam(subSys, target, cfgParam string) (value string, cs ValueSource) {
+//
+// When redactSecrets is true, the returned value is empty if the configuration
+// parameter is a secret, and the returned isRedacted flag is set.
+func (c Config) ResolveConfigParam(subSys, target, cfgParam string, redactSecrets bool,
+) (value string, cs ValueSource, isRedacted bool) {
 	// cs = ValueSourceAbsent initially as it is iota by default.
 
 	// Initially only support OpenID
@@ -1118,6 +1173,18 @@ func (c Config) ResolveConfigParam(subSys, target, cfgParam string) (value strin
 
 	if target == "" {
 		target = Default
+	}
+
+	if redactSecrets {
+		// If the configuration parameter is a secret, make sure to redact it when
+		// we return.
+		helpKV, _ := HelpSubSysMap[subSys].Lookup(cfgParam)
+		if helpKV.Secret {
+			defer func() {
+				value = ""
+				isRedacted = true
+			}()
+		}
 	}
 
 	envVar := getEnvVarName(subSys, target, cfgParam)
@@ -1157,8 +1224,7 @@ type KVSrc struct {
 
 // GetResolvedConfigParams returns all applicable config parameters with their
 // value sources.
-func (c Config) GetResolvedConfigParams(subSys, target string) ([]KVSrc, error) {
-	// Initially only support OpenID
+func (c Config) GetResolvedConfigParams(subSys, target string, redactSecrets bool) ([]KVSrc, error) {
 	if !resolvableSubsystems.Contains(subSys) {
 		return nil, Errorf("unsupported subsystem: %s", subSys)
 	}
@@ -1171,11 +1237,16 @@ func (c Config) GetResolvedConfigParams(subSys, target string) ([]KVSrc, error) 
 
 	r := make([]KVSrc, 0, len(defKVS)+1)
 	for _, kv := range defKVS {
-		v, vs := c.ResolveConfigParam(subSys, target, kv.Key)
+		v, vs, isRedacted := c.ResolveConfigParam(subSys, target, kv.Key, redactSecrets)
 
 		// Fix `vs` when default.
 		if v == kv.Value {
 			vs = ValueSourceDef
+		}
+
+		if redactSecrets && isRedacted {
+			// Skip adding redacted secrets to the output.
+			continue
 		}
 
 		r = append(r, KVSrc{
@@ -1185,8 +1256,9 @@ func (c Config) GetResolvedConfigParams(subSys, target string) ([]KVSrc, error) 
 		})
 	}
 
-	// Add the comment key as well if non-empty.
-	v, vs := c.ResolveConfigParam(subSys, target, Comment)
+	// Add the comment key as well if non-empty (and comments are never
+	// redacted).
+	v, vs, _ := c.ResolveConfigParam(subSys, target, Comment, redactSecrets)
 	if vs != ValueSourceDef {
 		r = append(r, KVSrc{
 			Key:   Comment,
@@ -1198,12 +1270,59 @@ func (c Config) GetResolvedConfigParams(subSys, target string) ([]KVSrc, error) 
 	return r, nil
 }
 
-func (c Config) getTargetKVS(subSys, target string) KVS {
+// getTargetKVS returns configuration KVs for the given subsystem and target. It
+// does not return any secrets in the configuration values when `redactSecrets`
+// is set.
+func (c Config) getTargetKVS(subSys, target string, redactSecrets bool) KVS {
 	store, ok := c[subSys]
 	if !ok {
 		return nil
 	}
-	return store[target]
+
+	// Lookup will succeed, because this function only works with valid subSys
+	// values.
+	resultKVS := make([]KV, 0, len(store[target]))
+	hkvs := HelpSubSysMap[subSys]
+	for _, kv := range store[target] {
+		hkv, _ := hkvs.Lookup(kv.Key)
+		if hkv.Secret && redactSecrets && kv.Value != "" {
+			// Skip returning secrets.
+			continue
+			// clonedKV := kv
+			// clonedKV.Value = redactedSecret
+			// resultKVS = append(resultKVS, clonedKV)
+		} else {
+			resultKVS = append(resultKVS, kv)
+		}
+	}
+
+	return resultKVS
+}
+
+// getTargetEnvs returns configured environment variable settings for the given
+// subsystem and target.
+func (c Config) getTargetEnvs(subSys, target string, defKVS KVS, redactSecrets bool) map[string]EnvPair {
+	hkvs := HelpSubSysMap[subSys]
+	envMap := make(map[string]EnvPair)
+
+	// Add all env vars that are set.
+	for _, kv := range defKVS {
+		envName := getEnvVarName(subSys, target, kv.Key)
+		envPair := EnvPair{
+			Name:  envName,
+			Value: env.Get(envName, ""),
+		}
+		if envPair.Value != "" {
+			hkv, _ := hkvs.Lookup(kv.Key)
+			if hkv.Secret && redactSecrets {
+				// Skip adding any secret to the returned value.
+				continue
+				// envPair.Value = redactedSecret
+			}
+			envMap[kv.Key] = envPair
+		}
+	}
+	return envMap
 }
 
 // EnvPair represents an environment variable and its value.
@@ -1224,7 +1343,7 @@ type SubsysInfo struct {
 // GetSubsysInfo returns `SubsysInfo`s for all targets for the subsystem, when
 // target is empty. Otherwise returns `SubsysInfo` for the desired target only.
 // To request the default target only, target must be set to `Default`.
-func (c Config) GetSubsysInfo(subSys, target string) ([]SubsysInfo, error) {
+func (c Config) GetSubsysInfo(subSys, target string, redactSecrets bool) ([]SubsysInfo, error) {
 	// Check if config param requested is valid.
 	defKVS1, ok := DefaultKVS[subSys]
 	if !ok {
@@ -1260,28 +1379,13 @@ func (c Config) GetSubsysInfo(subSys, target string) ([]SubsysInfo, error) {
 
 	r := make([]SubsysInfo, 0, len(targets))
 	for _, target := range targets {
-		kvs := c.getTargetKVS(subSys, target)
-		cs := SubsysInfo{
+		r = append(r, SubsysInfo{
 			SubSys:   subSys,
 			Target:   target,
 			Defaults: defKVS,
-			Config:   kvs,
-			EnvMap:   make(map[string]EnvPair),
-		}
-
-		// Add all env vars that are set.
-		for _, kv := range defKVS {
-			envName := getEnvVarName(subSys, target, kv.Key)
-			envPair := EnvPair{
-				Name:  envName,
-				Value: env.Get(envName, ""),
-			}
-			if envPair.Value != "" {
-				cs.EnvMap[kv.Key] = envPair
-			}
-		}
-
-		r = append(r, cs)
+			Config:   c.getTargetKVS(subSys, target, redactSecrets),
+			EnvMap:   c.getTargetEnvs(subSys, target, defKVS, redactSecrets),
+		})
 	}
 
 	return r, nil
@@ -1301,10 +1405,10 @@ func (cs *SubsysInfo) AddEnvString(b *strings.Builder) {
 	}
 }
 
-// AddString adds the string representation of the configuration to the given
+// WriteTo writes the string representation of the configuration to the given
 // builder. When off is true, adds a comment character before the config system
-// output.
-func (cs *SubsysInfo) AddString(b *strings.Builder, off bool) {
+// output. It also ignores values when empty and deprecated.
+func (cs *SubsysInfo) WriteTo(b *strings.Builder, off bool) {
 	cs.AddEnvString(b)
 	if off {
 		b.WriteString(KvComment)
@@ -1316,6 +1420,22 @@ func (cs *SubsysInfo) AddString(b *strings.Builder, off bool) {
 		b.WriteString(cs.Target)
 	}
 	b.WriteString(KvSpaceSeparator)
-	b.WriteString(cs.Config.String())
+	for _, kv := range cs.Config {
+		dkv, ok := cs.Defaults.LookupKV(kv.Key)
+		if !ok {
+			continue
+		}
+		// Ignore empty and deprecated values
+		if dkv.Deprecated && kv.Value == "" {
+			continue
+		}
+		// Do not need to print if state is on
+		if kv.Key == Enable && kv.Value == EnableOn {
+			continue
+		}
+		b.WriteString(kv.String())
+		b.WriteString(KvSpaceSeparator)
+	}
+
 	b.WriteString(KvNewline)
 }

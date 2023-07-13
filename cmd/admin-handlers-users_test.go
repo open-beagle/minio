@@ -33,10 +33,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/minio/madmin-go"
+	"github.com/minio/madmin-go/v3"
 	"github.com/minio/minio-go/v7"
 	"github.com/minio/minio-go/v7/pkg/credentials"
-	cr "github.com/minio/minio-go/v7/pkg/credentials"
 	"github.com/minio/minio-go/v7/pkg/s3utils"
 	"github.com/minio/minio-go/v7/pkg/set"
 	"github.com/minio/minio-go/v7/pkg/signer"
@@ -825,7 +824,7 @@ func (s *TestSuiteIAM) TestGroupAddRemove(c *check) {
 	if set.CreateStringSet(groups...).Contains(group) {
 		c.Fatalf("created group still present!")
 	}
-	groupInfo, err = s.adm.GetGroupDescription(ctx, group)
+	_, err = s.adm.GetGroupDescription(ctx, group)
 	if err == nil {
 		c.Fatalf("group appears to exist")
 	}
@@ -877,7 +876,7 @@ func (s *TestSuiteIAM) TestServiceAccountOpsByUser(c *check) {
 
 	// Create an madmin client with user creds
 	userAdmClient, err := madmin.NewWithOptions(s.endpoint, &madmin.Options{
-		Creds:  cr.NewStaticV4(accessKey, secretKey, ""),
+		Creds:  credentials.NewStaticV4(accessKey, secretKey, ""),
 		Secure: s.secure,
 	})
 	if err != nil {
@@ -1072,7 +1071,7 @@ func (s *TestSuiteIAM) TestAccMgmtPlugin(c *check) {
 
 	// Create an madmin client with user creds
 	userAdmClient, err := madmin.NewWithOptions(s.endpoint, &madmin.Options{
-		Creds:  cr.NewStaticV4(accessKey, secretKey, ""),
+		Creds:  credentials.NewStaticV4(accessKey, secretKey, ""),
 		Secure: s.secure,
 	})
 	if err != nil {
@@ -1136,7 +1135,7 @@ func (s *TestSuiteIAM) TestAccMgmtPlugin(c *check) {
 	c.assertSvcAccDeletion(ctx, s, userAdmClient, accessKey, bucket)
 
 	// 6. Check that service account **can** be created for some other user.
-	// This is possible because of the policy enforced in the plugin.
+	// This is possible because the policy enforced in the plugin.
 	c.mustCreateSvcAccount(ctx, globalActiveCred.AccessKey, userAdmClient)
 }
 
@@ -1261,6 +1260,52 @@ func (c *check) mustListBuckets(ctx context.Context, client *minio.Client) {
 	}
 }
 
+func (c *check) mustNotDelete(ctx context.Context, client *minio.Client, bucket string, vid string) {
+	c.Helper()
+
+	err := client.RemoveObject(ctx, bucket, "some-object", minio.RemoveObjectOptions{VersionID: vid})
+	if err == nil {
+		c.Fatalf("user must not be allowed to delete")
+	}
+
+	err = client.RemoveObject(ctx, bucket, "some-object", minio.RemoveObjectOptions{})
+	if err != nil {
+		c.Fatal("user must be able to create delete marker")
+	}
+}
+
+func (c *check) mustDownload(ctx context.Context, client *minio.Client, bucket string) {
+	c.Helper()
+	rd, err := client.GetObject(ctx, bucket, "some-object", minio.GetObjectOptions{})
+	if err != nil {
+		c.Fatalf("download did not succeed got %#v", err)
+	}
+	if _, err = io.Copy(io.Discard, rd); err != nil {
+		c.Fatalf("download did not succeed got %#v", err)
+	}
+}
+
+func (c *check) mustUploadReturnVersions(ctx context.Context, client *minio.Client, bucket string) []string {
+	c.Helper()
+	versions := []string{}
+	for i := 0; i < 5; i++ {
+		ui, err := client.PutObject(ctx, bucket, "some-object", bytes.NewBuffer([]byte("stuff")), 5, minio.PutObjectOptions{})
+		if err != nil {
+			c.Fatalf("upload did not succeed got %#v", err)
+		}
+		versions = append(versions, ui.VersionID)
+	}
+	return versions
+}
+
+func (c *check) mustUpload(ctx context.Context, client *minio.Client, bucket string) {
+	c.Helper()
+	_, err := client.PutObject(ctx, bucket, "some-object", bytes.NewBuffer([]byte("stuff")), 5, minio.PutObjectOptions{})
+	if err != nil {
+		c.Fatalf("upload did not succeed got %#v", err)
+	}
+}
+
 func (c *check) mustNotUpload(ctx context.Context, client *minio.Client, bucket string) {
 	c.Helper()
 	_, err := client.PutObject(ctx, bucket, "some-object", bytes.NewBuffer([]byte("stuff")), 5, minio.PutObjectOptions{})
@@ -1283,7 +1328,11 @@ func (c *check) assertSvcAccAppearsInListing(ctx context.Context, madmClient *ma
 	if err != nil {
 		c.Fatalf("unable to list svc accounts: %v", err)
 	}
-	if !set.CreateStringSet(listResp.Accounts...).Contains(svcAK) {
+	var accessKeys []string
+	for _, item := range listResp.Accounts {
+		accessKeys = append(accessKeys, item.AccessKey)
+	}
+	if !set.CreateStringSet(accessKeys...).Contains(svcAK) {
 		c.Fatalf("service account did not appear in listing!")
 	}
 }

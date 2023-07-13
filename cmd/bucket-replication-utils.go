@@ -1,4 +1,4 @@
-// Copyright (c) 2015-2021 MinIO, Inc.
+// Copyright (c) 2015-2023 MinIO, Inc.
 //
 // This file is part of MinIO Object Storage stack
 //
@@ -28,7 +28,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/minio/madmin-go"
+	"github.com/minio/madmin-go/v3"
 	"github.com/minio/minio/internal/bucket/replication"
 	xhttp "github.com/minio/minio/internal/http"
 )
@@ -496,8 +496,7 @@ func getHealReplicateObjectInfo(objInfo ObjectInfo, rcfg replicationConfig) Repl
 			oi.VersionPurgeStatusInternal = fmt.Sprintf("%s=%s;", rcfg.Config.RoleArn, oi.VersionPurgeStatus)
 		}
 		for k, v := range oi.UserDefined {
-			switch {
-			case strings.EqualFold(k, ReservedMetadataPrefixLower+ReplicationReset):
+			if strings.EqualFold(k, ReservedMetadataPrefixLower+ReplicationReset) {
 				delete(oi.UserDefined, k)
 				oi.UserDefined[targetResetHeader(rcfg.Config.RoleArn)] = v
 			}
@@ -513,7 +512,10 @@ func getHealReplicateObjectInfo(objInfo ObjectInfo, rcfg replicationConfig) Repl
 				ObjectName: oi.Name,
 				VersionID:  oi.VersionID,
 			},
-		}, oi, ObjectOptions{VersionSuspended: globalBucketVersioningSys.PrefixSuspended(oi.Bucket, oi.Name)}, nil)
+		}, oi, ObjectOptions{
+			Versioned:        globalBucketVersioningSys.PrefixEnabled(oi.Bucket, oi.Name),
+			VersionSuspended: globalBucketVersioningSys.PrefixSuspended(oi.Bucket, oi.Name),
+		}, nil)
 	} else {
 		dsc = mustReplicate(GlobalContext, oi.Bucket, oi.Name, getMustReplicateOptions(ObjectInfo{
 			UserDefined: oi.UserDefined,
@@ -534,12 +536,18 @@ func getHealReplicateObjectInfo(objInfo ObjectInfo, rcfg replicationConfig) Repl
 	}
 }
 
+func (ri *ReplicateObjectInfo) getReplicationState() ReplicationState {
+	rs := ri.ObjectInfo.getReplicationState()
+	rs.ReplicateDecisionStr = ri.Dsc.String()
+	return rs
+}
+
 // vID here represents the versionID client specified in request - need to distinguish between delete marker and delete marker deletion
-func (o *ObjectInfo) getReplicationState(dsc string, vID string, heal bool) ReplicationState {
+func (o *ObjectInfo) getReplicationState() ReplicationState {
 	rs := ReplicationState{
 		ReplicationStatusInternal:  o.ReplicationStatusInternal,
 		VersionPurgeStatusInternal: o.VersionPurgeStatusInternal,
-		ReplicateDecisionStr:       dsc,
+		ReplicateDecisionStr:       o.replicationDecision,
 		Targets:                    make(map[string]replication.StatusType),
 		PurgeTargets:               make(map[string]VersionPurgeStatusType),
 		ResetStatusesMap:           make(map[string]string),
@@ -628,19 +636,29 @@ func (v VersionPurgeStatusType) Pending() bool {
 	return v == Pending || v == Failed
 }
 
-type replicationResyncState struct {
+type replicationResyncer struct {
 	// map of bucket to their resync status
-	statusMap map[string]BucketReplicationResyncStatus
+	statusMap      map[string]BucketReplicationResyncStatus
+	workerSize     int
+	resyncCancelCh chan struct{}
+	workerCh       chan struct{}
 	sync.RWMutex
 }
 
 const (
-	replicationDir      = "replication"
+	replicationDir      = ".replication"
 	resyncFileName      = "resync.bin"
 	resyncMetaFormat    = 1
 	resyncMetaVersionV1 = 1
 	resyncMetaVersion   = resyncMetaVersionV1
 )
+
+type resyncOpts struct {
+	bucket       string
+	arn          string
+	resyncID     string
+	resyncBefore time.Time
+}
 
 // ResyncStatusType status of resync operation
 type ResyncStatusType int
@@ -648,6 +666,10 @@ type ResyncStatusType int
 const (
 	// NoResync - no resync in progress
 	NoResync ResyncStatusType = iota
+	// ResyncPending - resync pending
+	ResyncPending
+	// ResyncCanceled - resync canceled
+	ResyncCanceled
 	// ResyncStarted -  resync in progress
 	ResyncStarted
 	// ResyncCompleted -  resync finished
@@ -655,6 +677,10 @@ const (
 	// ResyncFailed -  resync failed
 	ResyncFailed
 )
+
+func (rt ResyncStatusType) isValid() bool {
+	return rt != NoResync
+}
 
 func (rt ResyncStatusType) String() string {
 	switch rt {
@@ -664,6 +690,10 @@ func (rt ResyncStatusType) String() string {
 		return "Completed"
 	case ResyncFailed:
 		return "Failed"
+	case ResyncPending:
+		return "Pending"
+	case ResyncCanceled:
+		return "Canceled"
 	default:
 		return ""
 	}
@@ -671,8 +701,8 @@ func (rt ResyncStatusType) String() string {
 
 // TargetReplicationResyncStatus status of resync of bucket for a specific target
 type TargetReplicationResyncStatus struct {
-	StartTime time.Time `json:"startTime" msg:"st"`
-	EndTime   time.Time `json:"endTime" msg:"et"`
+	StartTime  time.Time `json:"startTime" msg:"st"`
+	LastUpdate time.Time `json:"lastUpdated" msg:"lst"`
 	// Resync ID assigned to this reset
 	ResyncID string `json:"resyncID" msg:"id"`
 	// ResyncBeforeDate - resync all objects created prior to this date
@@ -699,6 +729,14 @@ type BucketReplicationResyncStatus struct {
 	TargetsMap map[string]TargetReplicationResyncStatus `json:"resyncMap,omitempty" msg:"brs"`
 	ID         int                                      `json:"id" msg:"id"`
 	LastUpdate time.Time                                `json:"lastUpdate" msg:"lu"`
+}
+
+func (rs *BucketReplicationResyncStatus) cloneTgtStats() (m map[string]TargetReplicationResyncStatus) {
+	m = make(map[string]TargetReplicationResyncStatus)
+	for arn, st := range rs.TargetsMap {
+		m[arn] = st
+	}
+	return
 }
 
 func newBucketResyncStatus(bucket string) BucketReplicationResyncStatus {
@@ -767,9 +805,8 @@ func (ri ReplicateObjectInfo) ToMRFEntry() MRFReplicateEntry {
 	}
 }
 
-func getReplicationStatsPath(nodeName string) string {
-	nodeStr := strings.ReplaceAll(nodeName, ":", "_")
-	return bucketMetaPrefix + SlashSeparator + replicationDir + SlashSeparator + nodeStr + ".stats"
+func getReplicationStatsPath() string {
+	return bucketMetaPrefix + SlashSeparator + replicationDir + SlashSeparator + "replication.stats"
 }
 
 const (

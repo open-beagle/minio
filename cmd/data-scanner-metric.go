@@ -1,3 +1,20 @@
+// Copyright (c) 2015-2022 MinIO, Inc.
+//
+// This file is part of MinIO Object Storage stack
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU Affero General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU Affero General Public License for more details.
+//
+// You should have received a copy of the GNU Affero General Public License
+// along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
 package cmd
 
 import (
@@ -7,7 +24,7 @@ import (
 	"time"
 	"unsafe"
 
-	"github.com/minio/madmin-go"
+	"github.com/minio/madmin-go/v3"
 	"github.com/minio/minio/internal/bucket/lifecycle"
 )
 
@@ -47,6 +64,8 @@ const (
 	scannerMetricILM
 	scannerMetricCheckReplication
 	scannerMetricYield
+	scannerMetricCleanAbandoned
+	scannerMetricApplyNonCurrent
 
 	// START Trace metrics:
 	scannerMetricStartTrace
@@ -56,9 +75,10 @@ const (
 	scannerMetricLastRealtime
 
 	// Trace only metrics:
-	scannerMetricScanFolder     // Scan a folder on disk, recursively.
-	scannerMetricScanCycle      // Full cycle, cluster global
-	scannerMetricScanBucketDisk // Single bucket on one disk
+	scannerMetricScanFolder      // Scan a folder on disk, recursively.
+	scannerMetricScanCycle       // Full cycle, cluster global
+	scannerMetricScanBucketDrive // Single bucket on one drive
+	scannerMetricCompactFolder   // Folder compacted.
 
 	// Must be last:
 	scannerMetricLast
@@ -66,9 +86,9 @@ const (
 
 // log scanner action.
 // Use for s > scannerMetricStartTrace
-func (p *scannerMetrics) log(s scannerMetric, paths ...string) func() {
+func (p *scannerMetrics) log(s scannerMetric, paths ...string) func(custom map[string]string) {
 	startTime := time.Now()
-	return func() {
+	return func(custom map[string]string) {
 		duration := time.Since(startTime)
 
 		atomic.AddUint64(&p.operations[s], 1)
@@ -77,7 +97,7 @@ func (p *scannerMetrics) log(s scannerMetric, paths ...string) func() {
 		}
 
 		if s > scannerMetricStartTrace && globalTrace.NumSubscribers(madmin.TraceScanner) > 0 {
-			globalTrace.Publish(scannerTrace(s, startTime, duration, strings.Join(paths, " ")))
+			globalTrace.Publish(scannerTrace(s, startTime, duration, strings.Join(paths, " "), custom))
 		}
 	}
 }
@@ -116,13 +136,6 @@ func (p *scannerMetrics) incTime(s scannerMetric, d time.Duration) {
 	atomic.AddUint64(&p.operations[s], 1)
 	if s < scannerMetricLastRealtime {
 		p.latency[s].add(d)
-	}
-}
-
-func (p *scannerMetrics) incNoTime(s scannerMetric) {
-	atomic.AddUint64(&p.operations[s], 1)
-	if s < scannerMetricLastRealtime {
-		p.latency[s].add(0)
 	}
 }
 
@@ -186,9 +199,9 @@ func (p *scannerMetrics) getCurrentPaths() []string {
 	return res
 }
 
-// activeDisks returns the number of currently active disks.
+// activeDrives returns the number of currently active disks.
 // (since this is concurrent it may not be 100% reliable)
-func (p *scannerMetrics) activeDisks() int {
+func (p *scannerMetrics) activeDrives() int {
 	var i int
 	p.currentPaths.Range(func(k, v interface{}) bool {
 		i++
@@ -199,7 +212,7 @@ func (p *scannerMetrics) activeDisks() int {
 
 // lifetime returns the lifetime count of the specified metric.
 func (p *scannerMetrics) lifetime(m scannerMetric) uint64 {
-	if m < 0 || m >= scannerMetricLast {
+	if m >= scannerMetricLast {
 		return 0
 	}
 	val := atomic.LoadUint64(&p.operations[m])
@@ -209,7 +222,7 @@ func (p *scannerMetrics) lifetime(m scannerMetric) uint64 {
 // lastMinute returns the last minute statistics of a metric.
 // m should be < scannerMetricLastRealtime
 func (p *scannerMetrics) lastMinute(m scannerMetric) AccElem {
-	if m < 0 || m >= scannerMetricLastRealtime {
+	if m >= scannerMetricLastRealtime {
 		return AccElem{}
 	}
 	val := p.latency[m].total()

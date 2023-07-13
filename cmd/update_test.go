@@ -179,7 +179,7 @@ func TestUserAgent(t *testing.T) {
 		if IsDocker() {
 			expectedStr = strings.ReplaceAll(expectedStr, "; source", "; docker; source")
 		}
-		if str != expectedStr {
+		if !strings.Contains(str, expectedStr) {
 			t.Errorf("Test %d: expected: %s, got: %s", i+1, expectedStr, str)
 		}
 		globalIsCICD = sci
@@ -300,13 +300,14 @@ func TestDownloadReleaseData(t *testing.T) {
 		}
 
 		result, err := downloadReleaseURL(u, 1*time.Second, "")
-		if testCase.expectedErr == nil {
+		switch {
+		case testCase.expectedErr == nil:
 			if err != nil {
 				t.Fatalf("error: expected: %v, got: %v", testCase.expectedErr, err)
 			}
-		} else if err == nil {
+		case err == nil:
 			t.Fatalf("error: expected: %v, got: %v", testCase.expectedErr, err)
-		} else if testCase.expectedErr.Error() != err.Error() {
+		case testCase.expectedErr.Error() != err.Error():
 			t.Fatalf("error: expected: %v, got: %v", testCase.expectedErr, err)
 		}
 

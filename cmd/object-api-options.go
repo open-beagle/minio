@@ -33,7 +33,6 @@ import (
 	"github.com/minio/minio/internal/logger"
 )
 
-// set encryption options for pass through to backend in the case of gateway and UserDefined metadata
 func getDefaultOpts(header http.Header, copySource bool, metadata map[string]string) (opts ObjectOptions, err error) {
 	var clientKey [32]byte
 	var sse encrypt.ServerSide
@@ -81,10 +80,7 @@ func getDefaultOpts(header http.Header, copySource bool, metadata map[string]str
 
 // get ObjectOptions for GET calls from encryption headers
 func getOpts(ctx context.Context, r *http.Request, bucket, object string) (ObjectOptions, error) {
-	var (
-		encryption encrypt.ServerSide
-		opts       ObjectOptions
-	)
+	var opts ObjectOptions
 
 	var partNumber int
 	var err error
@@ -93,6 +89,9 @@ func getOpts(ctx context.Context, r *http.Request, bucket, object string) (Objec
 		if err != nil {
 			return opts, err
 		}
+		if isMaxPartID(partNumber) {
+			return opts, errInvalidMaxParts
+		}
 		if partNumber <= 0 {
 			return opts, errInvalidArgument
 		}
@@ -100,30 +99,13 @@ func getOpts(ctx context.Context, r *http.Request, bucket, object string) (Objec
 
 	vid := strings.TrimSpace(r.Form.Get(xhttp.VersionID))
 	if vid != "" && vid != nullVersionID {
-		_, err := uuid.Parse(vid)
-		if err != nil {
-			logger.LogIf(ctx, err)
+		if _, err := uuid.Parse(vid); err != nil {
 			return opts, InvalidVersionID{
 				Bucket:    bucket,
 				Object:    object,
 				VersionID: vid,
 			}
 		}
-	}
-
-	if GlobalGatewaySSE.SSEC() && crypto.SSEC.IsRequested(r.Header) {
-		key, err := crypto.SSEC.ParseHTTP(r.Header)
-		if err != nil {
-			return opts, err
-		}
-		derivedKey := deriveClientKey(key, bucket, object)
-		encryption, err = encrypt.NewSSEC(derivedKey[:])
-		logger.CriticalIf(ctx, err)
-		return ObjectOptions{
-			ServerSideEncryption: encryption,
-			VersionID:            vid,
-			PartNumber:           partNumber,
-		}, nil
 	}
 
 	deletePrefix := false
@@ -192,6 +174,11 @@ func delOpts(ctx context.Context, r *http.Request, bucket, object string) (opts 
 	// benefits of replication, make sure to apply version suspension
 	// only at bucket level instead.
 	opts.VersionSuspended = globalBucketVersioningSys.Suspended(bucket)
+	// For directory objects, delete `null` version permanently.
+	if isDirObject(object) && opts.VersionID == "" {
+		opts.VersionID = nullVersionID
+	}
+
 	delMarker := strings.TrimSpace(r.Header.Get(xhttp.MinIOSourceDeleteMarker))
 	if delMarker != "" {
 		switch delMarker {
@@ -253,7 +240,7 @@ func putOpts(ctx context.Context, r *http.Request, bucket, object string, metada
 	mtimeStr := strings.TrimSpace(r.Header.Get(xhttp.MinIOSourceMTime))
 	mtime := UTCNow()
 	if mtimeStr != "" {
-		mtime, err = time.Parse(time.RFC3339, mtimeStr)
+		mtime, err = time.Parse(time.RFC3339Nano, mtimeStr)
 		if err != nil {
 			return opts, InvalidArgument{
 				Bucket: bucket,
@@ -304,9 +291,7 @@ func putOpts(ctx context.Context, r *http.Request, bucket, object string, metada
 		metadata = make(map[string]string)
 	}
 
-	etag := strings.TrimSpace(r.Header.Get(xhttp.MinIOSourceETag))
-
-	wantCRC, err := hash.GetContentChecksum(r)
+	wantCRC, err := hash.GetContentChecksum(r.Header)
 	if err != nil {
 		return opts, InvalidArgument{
 			Bucket: bucket,
@@ -314,30 +299,8 @@ func putOpts(ctx context.Context, r *http.Request, bucket, object string, metada
 			Err:    fmt.Errorf("invalid/unknown checksum sent: %v", err),
 		}
 	}
+	etag := strings.TrimSpace(r.Header.Get(xhttp.MinIOSourceETag))
 
-	// In the case of multipart custom format, the metadata needs to be checked in addition to header to see if it
-	// is SSE-S3 encrypted, primarily because S3 protocol does not require SSE-S3 headers in PutObjectPart calls
-	if GlobalGatewaySSE.SSES3() && (crypto.S3.IsRequested(r.Header) || crypto.S3.IsEncrypted(metadata)) {
-		return ObjectOptions{
-			ServerSideEncryption: encrypt.NewSSE(),
-			UserDefined:          metadata,
-			VersionID:            vid,
-			Versioned:            versioned,
-			VersionSuspended:     versionSuspended,
-			MTime:                mtime,
-			PreserveETag:         etag,
-			WantChecksum:         wantCRC,
-		}, nil
-	}
-	if GlobalGatewaySSE.SSEC() && crypto.SSEC.IsRequested(r.Header) {
-		opts, err = getOpts(ctx, r, bucket, object)
-		opts.VersionID = vid
-		opts.Versioned = versioned
-		opts.VersionSuspended = versionSuspended
-		opts.UserDefined = metadata
-		opts.WantChecksum = wantCRC
-		return
-	}
 	if crypto.S3KMS.IsRequested(r.Header) {
 		keyID, context, err := crypto.S3KMS.ParseHTTP(r.Header)
 		if err != nil {
@@ -355,6 +318,7 @@ func putOpts(ctx context.Context, r *http.Request, bucket, object string, metada
 			VersionSuspended:     versionSuspended,
 			MTime:                mtime,
 			WantChecksum:         wantCRC,
+			PreserveETag:         etag,
 		}, nil
 	}
 	// default case of passing encryption headers and UserDefined metadata to backend
@@ -362,13 +326,21 @@ func putOpts(ctx context.Context, r *http.Request, bucket, object string, metada
 	if err != nil {
 		return opts, err
 	}
+
 	opts.VersionID = vid
 	opts.Versioned = versioned
 	opts.VersionSuspended = versionSuspended
+
+	// For directory objects skip creating new versions.
+	if isDirObject(object) && vid == "" {
+		opts.VersionID = nullVersionID
+	}
+
 	opts.MTime = mtime
 	opts.ReplicationSourceLegalholdTimestamp = lholdtimestmp
 	opts.ReplicationSourceRetentionTimestamp = retaintimestmp
 	opts.ReplicationSourceTaggingTimestamp = taggingtimestmp
+	opts.PreserveETag = etag
 	opts.WantChecksum = wantCRC
 
 	return opts, nil
@@ -381,23 +353,7 @@ func copyDstOpts(ctx context.Context, r *http.Request, bucket, object string, me
 
 // get ObjectOptions for Copy calls with encryption headers provided on the source side
 func copySrcOpts(ctx context.Context, r *http.Request, bucket, object string) (ObjectOptions, error) {
-	var (
-		ssec encrypt.ServerSide
-		opts ObjectOptions
-	)
-
-	if GlobalGatewaySSE.SSEC() && crypto.SSECopy.IsRequested(r.Header) {
-		key, err := crypto.SSECopy.ParseHTTP(r.Header)
-		if err != nil {
-			return opts, err
-		}
-		derivedKey := deriveClientKey(key, bucket, object)
-		ssec, err = encrypt.NewSSEC(derivedKey[:])
-		if err != nil {
-			return opts, err
-		}
-		return ObjectOptions{ServerSideEncryption: encrypt.SSECopy(ssec)}, nil
-	}
+	var opts ObjectOptions
 
 	// default case of passing encryption headers to backend
 	opts, err := getDefaultOpts(r.Header, false, nil)
@@ -412,7 +368,7 @@ func completeMultipartOpts(ctx context.Context, r *http.Request, bucket, object 
 	mtimeStr := strings.TrimSpace(r.Header.Get(xhttp.MinIOSourceMTime))
 	mtime := UTCNow()
 	if mtimeStr != "" {
-		mtime, err = time.Parse(time.RFC3339, mtimeStr)
+		mtime, err = time.Parse(time.RFC3339Nano, mtimeStr)
 		if err != nil {
 			return opts, InvalidArgument{
 				Bucket: bucket,
@@ -421,7 +377,7 @@ func completeMultipartOpts(ctx context.Context, r *http.Request, bucket, object 
 			}
 		}
 	}
-	opts.WantChecksum, err = hash.GetContentChecksum(r)
+	opts.WantChecksum, err = hash.GetContentChecksum(r.Header)
 	if err != nil {
 		return opts, InvalidArgument{
 			Bucket: bucket,
@@ -431,5 +387,16 @@ func completeMultipartOpts(ctx context.Context, r *http.Request, bucket, object 
 	}
 	opts.MTime = mtime
 	opts.UserDefined = make(map[string]string)
+
+	// Transfer SSEC key in opts.EncryptFn
+	if crypto.SSEC.IsRequested(r.Header) {
+		key, err := ParseSSECustomerRequest(r)
+		if err == nil {
+			// Set EncryptFn to return SSEC key
+			opts.EncryptFn = func(baseKey string, data []byte) []byte {
+				return key
+			}
+		}
+	}
 	return opts, nil
 }

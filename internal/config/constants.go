@@ -61,20 +61,12 @@ const (
 	EnvMinIOCallhomeEnable    = "MINIO_CALLHOME_ENABLE"
 	EnvMinIOCallhomeFrequency = "MINIO_CALLHOME_FREQUENCY"
 
-	EnvMinIOServerURL          = "MINIO_SERVER_URL"
-	EnvMinIOBrowserRedirectURL = "MINIO_BROWSER_REDIRECT_URL"
-	EnvRootDiskThresholdSize   = "MINIO_ROOTDISK_THRESHOLD_SIZE"
+	EnvMinIOServerURL        = "MINIO_SERVER_URL"
+	EnvBrowserRedirectURL    = "MINIO_BROWSER_REDIRECT_URL"
+	EnvRootDiskThresholdSize = "MINIO_ROOTDISK_THRESHOLD_SIZE"
+	EnvBrowserLoginAnimation = "MINIO_BROWSER_LOGIN_ANIMATION"
 
 	EnvUpdate = "MINIO_UPDATE"
-
-	EnvKMSSecretKey      = "MINIO_KMS_SECRET_KEY"
-	EnvKMSSecretKeyFile  = "MINIO_KMS_SECRET_KEY_FILE"
-	EnvKESEndpoint       = "MINIO_KMS_KES_ENDPOINT"
-	EnvKESKeyName        = "MINIO_KMS_KES_KEY_NAME"
-	EnvKESClientKey      = "MINIO_KMS_KES_KEY_FILE"
-	EnvKESClientPassword = "MINIO_KMS_KES_KEY_PASSWORD"
-	EnvKESClientCert     = "MINIO_KMS_KES_CERT_FILE"
-	EnvKESServerCA       = "MINIO_KMS_KES_CAPATH"
 
 	EnvEndpoints  = "MINIO_ENDPOINTS"   // legacy
 	EnvWorm       = "MINIO_WORM"        // legacy

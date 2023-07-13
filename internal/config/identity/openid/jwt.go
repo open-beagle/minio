@@ -18,7 +18,7 @@
 package openid
 
 import (
-	"crypto"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -38,7 +38,7 @@ type publicKeys struct {
 	*sync.RWMutex
 
 	// map of kid to public key
-	pkMap map[string]crypto.PublicKey
+	pkMap map[string]interface{}
 }
 
 func (pk *publicKeys) parseAndAdd(b io.Reader) error {
@@ -48,19 +48,25 @@ func (pk *publicKeys) parseAndAdd(b io.Reader) error {
 		return err
 	}
 
-	pk.Lock()
-	defer pk.Unlock()
-
 	for _, key := range jwk.Keys {
-		pk.pkMap[key.Kid], err = key.DecodePublicKey()
+		pkey, err := key.DecodePublicKey()
 		if err != nil {
 			return err
 		}
+		pk.add(key.Kid, pkey)
 	}
+
 	return nil
 }
 
-func (pk *publicKeys) get(kid string) crypto.PublicKey {
+func (pk *publicKeys) add(keyID string, key interface{}) {
+	pk.Lock()
+	defer pk.Unlock()
+
+	pk.pkMap[keyID] = key
+}
+
+func (pk *publicKeys) get(kid string) interface{} {
 	pk.RLock()
 	defer pk.RUnlock()
 	return pk.pkMap[kid]
@@ -72,6 +78,10 @@ func (r *Config) PopulatePublicKey(arn arn.ARN) error {
 	if pCfg.JWKS.URL == nil || pCfg.JWKS.URL.String() == "" {
 		return nil
 	}
+
+	// Add client secret for the client ID for HMAC based signature.
+	r.pubKeys.add(pCfg.ClientID, []byte(pCfg.ClientSecret))
+
 	client := &http.Client{
 		Transport: r.transport,
 	}
@@ -131,11 +141,14 @@ const (
 )
 
 // Validate - validates the id_token.
-func (r *Config) Validate(arn arn.ARN, token, accessToken, dsecs string, claims jwtgo.MapClaims) error {
+func (r *Config) Validate(ctx context.Context, arn arn.ARN, token, accessToken, dsecs string, claims jwtgo.MapClaims) error {
 	jp := new(jwtgo.Parser)
 	jp.ValidMethods = []string{
-		"RS256", "RS384", "RS512", "ES256", "ES384", "ES512",
-		"RS3256", "RS3384", "RS3512", "ES3256", "ES3384", "ES3512",
+		"RS256", "RS384", "RS512",
+		"ES256", "ES384", "ES512",
+		"HS256", "HS384", "HS512",
+		"RS3256", "RS3384", "RS3512",
+		"ES3256", "ES3384", "ES3512",
 	}
 
 	keyFuncCallback := func(jwtToken *jwtgo.Token) (interface{}, error) {
@@ -172,7 +185,7 @@ func (r *Config) Validate(arn arn.ARN, token, accessToken, dsecs string, claims 
 		return err
 	}
 
-	if err = r.updateUserinfoClaims(arn, accessToken, claims); err != nil {
+	if err = r.updateUserinfoClaims(ctx, arn, accessToken, claims); err != nil {
 		return err
 	}
 
@@ -211,7 +224,7 @@ func (r *Config) Validate(arn arn.ARN, token, accessToken, dsecs string, claims 
 	return nil
 }
 
-func (r *Config) updateUserinfoClaims(arn arn.ARN, accessToken string, claims map[string]interface{}) error {
+func (r *Config) updateUserinfoClaims(ctx context.Context, arn arn.ARN, accessToken string, claims map[string]interface{}) error {
 	pCfg, ok := r.arnProviderCfgsMap[arn]
 	// If claim user info is enabled, get claims from userInfo
 	// and overwrite them with the claims from JWT.
@@ -219,7 +232,7 @@ func (r *Config) updateUserinfoClaims(arn arn.ARN, accessToken string, claims ma
 		if accessToken == "" {
 			return errors.New("access_token is mandatory if user_info claim is enabled")
 		}
-		uclaims, err := pCfg.UserInfo(accessToken, r.transport)
+		uclaims, err := pCfg.UserInfo(ctx, accessToken, r.transport)
 		if err != nil {
 			return err
 		}
@@ -238,6 +251,7 @@ type DiscoveryDoc struct {
 	Issuer                           string   `json:"issuer,omitempty"`
 	AuthEndpoint                     string   `json:"authorization_endpoint,omitempty"`
 	TokenEndpoint                    string   `json:"token_endpoint,omitempty"`
+	EndSessionEndpoint               string   `json:"end_session_endpoint,omitempty"`
 	UserInfoEndpoint                 string   `json:"userinfo_endpoint,omitempty"`
 	RevocationEndpoint               string   `json:"revocation_endpoint,omitempty"`
 	JwksURI                          string   `json:"jwks_uri,omitempty"`
@@ -265,7 +279,7 @@ func parseDiscoveryDoc(u *xnet.URL, transport http.RoundTripper, closeRespFn fun
 	}
 	defer closeRespFn(resp.Body)
 	if resp.StatusCode != http.StatusOK {
-		return d, err
+		return d, fmt.Errorf("unexpected error returned by %s : status(%s)", u, resp.Status)
 	}
 	dec := json.NewDecoder(resp.Body)
 	if err = dec.Decode(&d); err != nil {

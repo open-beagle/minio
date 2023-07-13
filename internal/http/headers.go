@@ -89,8 +89,9 @@ const (
 	AmzObjectLockLegalHold        = "X-Amz-Object-Lock-Legal-Hold"
 	AmzObjectLockBypassGovernance = "X-Amz-Bypass-Governance-Retention"
 	AmzBucketReplicationStatus    = "X-Amz-Replication-Status"
-	AmzSnowballExtract            = "X-Amz-Meta-Snowball-Auto-Extract"
 
+	// AmzSnowballExtract will trigger unpacking of an archive content
+	AmzSnowballExtract = "X-Amz-Meta-Snowball-Auto-Extract"
 	// MinIOSnowballIgnoreDirs will skip creating empty directory objects.
 	MinIOSnowballIgnoreDirs = "X-Amz-Meta-Minio-Snowball-Ignore-Dirs"
 	// MinIOSnowballIgnoreErrors will ignore recoverable errors, typically single files failing to upload.
@@ -145,7 +146,8 @@ const (
 	AmzAccessKeyID = "AWSAccessKeyId"
 
 	// Response request id.
-	AmzRequestID = "x-amz-request-id"
+	AmzRequestID     = "x-amz-request-id"
+	AmzRequestHostID = "x-amz-id-2"
 
 	// Deployment id.
 	MinioDeploymentID = "x-minio-deployment-id"
@@ -176,6 +178,10 @@ const (
 	// Writes expected write quorum
 	MinIOWriteQuorum = "x-minio-write-quorum"
 
+	// Indicates if we are using default storage class and there was problem loading config
+	// if this header is set to "true"
+	MinIOStorageClassDefaults = "x-minio-storage-class-defaults"
+
 	// Reports number of drives currently healing
 	MinIOHealingDrives = "x-minio-healing-drives"
 
@@ -193,6 +199,8 @@ const (
 	MinIOSourceProxyRequest = "X-Minio-Source-Proxy-Request"
 	// Header indicates that this request is a replication request to create a REPLICA
 	MinIOSourceReplicationRequest = "X-Minio-Source-Replication-Request"
+	// Header checks replication permissions without actually completing replication
+	MinIOSourceReplicationCheck = "X-Minio-Source-Replication-Check"
 	// Header indicates replication reset status.
 	MinIOReplicationResetStatus = "X-Minio-Replication-Reset-Status"
 	// Header indicating target cluster can receive delete marker replication requests because object has been replicated
@@ -206,10 +214,13 @@ const (
 	// Header indiicates last rtention update time on source
 	MinIOSourceObjectLegalHoldTimestamp = "X-Minio-Source-Replication-LegalHold-Timestamp"
 	// predicted date/time of transition
-	MinIOTransition = "X-Minio-Transition"
-
+	MinIOTransition            = "X-Minio-Transition"
+	MinIOLifecycleCfgUpdatedAt = "X-Minio-LifecycleConfig-UpdatedAt"
 	// MinIOCompressed is returned when object is compressed
 	MinIOCompressed = "X-Minio-Compressed"
+
+	// SUBNET related
+	SubnetAPIKey = "x-subnet-api-key"
 )
 
 // Common http query params S3 API

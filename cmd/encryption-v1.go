@@ -1,4 +1,4 @@
-// Copyright (c) 2015-2021 MinIO, Inc.
+// Copyright (c) 2015-2023 MinIO, Inc.
 //
 // This file is part of MinIO Object Storage stack
 //
@@ -34,7 +34,7 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/minio/kes"
+	"github.com/minio/kes-go"
 	"github.com/minio/minio/internal/crypto"
 	"github.com/minio/minio/internal/etag"
 	"github.com/minio/minio/internal/fips"
@@ -48,14 +48,16 @@ import (
 
 var (
 	// AWS errors for invalid SSE-C requests.
-	errEncryptedObject      = errors.New("The object was stored using a form of SSE")
-	errInvalidSSEParameters = errors.New("The SSE-C key for key-rotation is not correct") // special access denied
-	errKMSNotConfigured     = errors.New("KMS not configured for a server side encrypted object")
-	errKMSKeyNotFound       = errors.New("Invalid KMS keyId")
+	errEncryptedObject                = errors.New("The object was stored using a form of SSE")
+	errInvalidSSEParameters           = errors.New("The SSE-C key for key-rotation is not correct") // special access denied
+	errKMSNotConfigured               = errors.New("KMS not configured for a server side encrypted objects")
+	errKMSKeyNotFound                 = errors.New("Unknown KMS key ID")
+	errKMSDefaultKeyAlreadyConfigured = errors.New("A default encryption already exists on KMS")
 	// Additional MinIO errors for SSE-C requests.
 	errObjectTampered = errors.New("The requested object was modified and may be compromised")
 	// error returned when invalid encryption parameters are specified
-	errInvalidEncryptionParameters = errors.New("The encryption parameters are not applicable to this object")
+	errInvalidEncryptionParameters     = errors.New("The encryption parameters are not applicable to this object")
+	errInvalidEncryptionParametersSSEC = errors.New("SSE-C encryption parameters are not supported on this bucket")
 )
 
 const (
@@ -108,7 +110,7 @@ func kmsKeyIDFromMetadata(metadata map[string]string) string {
 //
 // DecryptETags uses a KMS bulk decryption API, if available, which
 // is more efficient than decrypting ETags sequentually.
-func DecryptETags(ctx context.Context, KMS kms.KMS, objects []ObjectInfo) error {
+func DecryptETags(ctx context.Context, k kms.KMS, objects []ObjectInfo) error {
 	const BatchSize = 250 // We process the objects in batches - 250 is a reasonable default.
 	var (
 		metadata = make([]map[string]string, 0, BatchSize)
@@ -168,7 +170,7 @@ func DecryptETags(ctx context.Context, KMS kms.KMS, objects []ObjectInfo) error 
 		// For all SSE-S3 single-part objects we have to
 		// fetch their decryption keys. We do this using
 		// a Bulk-Decryption API call, if available.
-		keys, err := crypto.S3.UnsealObjectKeys(ctx, KMS, metadata, buckets, names)
+		keys, err := crypto.S3.UnsealObjectKeys(ctx, k, metadata, buckets, names)
 		if err != nil {
 			return err
 		}
@@ -816,8 +818,8 @@ func getDecryptedETag(headers http.Header, objInfo ObjectInfo, copySource bool) 
 
 	// As per AWS S3 Spec, ETag for SSE-C encrypted objects need not be MD5Sum of the data.
 	// Since server side copy with same source and dest just replaces the ETag, we save
-	// encrypted content MD5Sum as ETag for both SSE-C and SSE-S3, we standardize the ETag
-	// encryption across SSE-C and SSE-S3, and only return last 32 bytes for SSE-C
+	// encrypted content MD5Sum as ETag for both SSE-C and SSE-KMS, we standardize the ETag
+	// encryption across SSE-C and SSE-KMS, and only return last 32 bytes for SSE-C
 	if (crypto.SSEC.IsEncrypted(objInfo.UserDefined) || crypto.S3KMS.IsEncrypted(objInfo.UserDefined)) && !copySource {
 		return objInfo.ETag[len(objInfo.ETag)-32:]
 	}
@@ -826,15 +828,15 @@ func getDecryptedETag(headers http.Header, objInfo ObjectInfo, copySource bool) 
 	if err != nil {
 		return objInfo.ETag
 	}
-	return tryDecryptETag(objectEncryptionKey, objInfo.ETag, false)
+	return tryDecryptETag(objectEncryptionKey, objInfo.ETag, true)
 }
 
 // helper to decrypt Etag given object encryption key and encrypted ETag
-func tryDecryptETag(key []byte, encryptedETag string, ssec bool) string {
-	// ETag for SSE-C encrypted objects need not be content MD5Sum.While encrypted
+func tryDecryptETag(key []byte, encryptedETag string, sses3 bool) string {
+	// ETag for SSE-C or SSE-KMS encrypted objects need not be content MD5Sum.While encrypted
 	// md5sum is stored internally, return just the last 32 bytes of hex-encoded and
 	// encrypted md5sum string for SSE-C
-	if ssec {
+	if !sses3 {
 		return encryptedETag[len(encryptedETag)-32:]
 	}
 	var objectKey crypto.ObjectKey
@@ -1043,18 +1045,6 @@ func DecryptObjectInfo(info *ObjectInfo, r *http.Request) (encrypted bool, err e
 	return encrypted, nil
 }
 
-// The customer key in the header is used by the gateway for encryption in the case of
-// s3 gateway double encryption. A new client key is derived from the customer provided
-// key to be sent to the s3 backend for encryption at the backend.
-func deriveClientKey(clientKey [32]byte, bucket, object string) [32]byte {
-	var key [32]byte
-	mac := hmac.New(sha256.New, clientKey[:])
-	mac.Write([]byte(crypto.SSEC.String()))
-	mac.Write([]byte(path.Join(bucket, object)))
-	mac.Sum(key[:0])
-	return key
-}
-
 type (
 	objectMetaEncryptFn func(baseKey string, data []byte) []byte
 	objectMetaDecryptFn func(baseKey string, data []byte) ([]byte, error)
@@ -1095,8 +1085,47 @@ func (o *ObjectInfo) metadataDecrypter() objectMetaDecryptFn {
 	}
 }
 
+// metadataEncryptFn provides an encryption function for metadata.
+// Will return nil, nil if unencrypted.
+func (o *ObjectInfo) metadataEncryptFn(headers http.Header) (objectMetaEncryptFn, error) {
+	kind, _ := crypto.IsEncrypted(o.UserDefined)
+	switch kind {
+	case crypto.SSEC:
+		if crypto.SSECopy.IsRequested(headers) {
+			key, err := crypto.SSECopy.ParseHTTP(headers)
+			if err != nil {
+				return nil, err
+			}
+			objectEncryptionKey, err := decryptObjectMeta(key[:], o.Bucket, o.Name, o.UserDefined)
+			if err != nil {
+				return nil, err
+			}
+			if len(objectEncryptionKey) == 32 {
+				var key crypto.ObjectKey
+				copy(key[:], objectEncryptionKey)
+				return metadataEncrypter(key), nil
+			}
+			return nil, errors.New("metadataEncryptFn: unexpected key size")
+		}
+	case crypto.S3, crypto.S3KMS:
+		objectEncryptionKey, err := decryptObjectMeta(nil, o.Bucket, o.Name, o.UserDefined)
+		if err != nil {
+			return nil, err
+		}
+		if len(objectEncryptionKey) == 32 {
+			var key crypto.ObjectKey
+			copy(key[:], objectEncryptionKey)
+			return metadataEncrypter(key), nil
+		}
+		return nil, errors.New("metadataEncryptFn: unexpected key size")
+	}
+
+	return nil, nil
+}
+
 // decryptChecksums will attempt to decode checksums and return it/them if set.
-func (o *ObjectInfo) decryptChecksums() map[string]string {
+// if part > 0, and we have the checksum for the part that will be returned.
+func (o *ObjectInfo) decryptChecksums(part int) map[string]string {
 	data := o.Checksum
 	if len(data) == 0 {
 		return nil
@@ -1109,5 +1138,5 @@ func (o *ObjectInfo) decryptChecksums() map[string]string {
 		}
 		data = decrypted
 	}
-	return hash.ReadCheckSums(data)
+	return hash.ReadCheckSums(data, part)
 }

@@ -26,15 +26,15 @@ import (
 	"strings"
 	"time"
 
-	"github.com/minio/madmin-go"
+	"github.com/minio/madmin-go/v3"
 	"github.com/minio/minio/internal/config"
+	"github.com/minio/minio/internal/kms"
 	"github.com/minio/minio/internal/logger"
 )
 
 // getLocalServerProperty - returns madmin.ServerProperties for only the
 // local endpoints from given list of endpoints
 func getLocalServerProperty(endpointServerPools EndpointServerPools, r *http.Request) madmin.ServerProperties {
-	var localEndpoints Endpoints
 	addr := globalLocalNodeName
 	if r != nil {
 		addr = r.Host
@@ -52,7 +52,6 @@ func getLocalServerProperty(endpointServerPools EndpointServerPools, r *http.Req
 			if endpoint.IsLocal {
 				// Only proceed for local endpoints
 				network[nodeName] = string(madmin.ItemOnline)
-				localEndpoints = append(localEndpoints, endpoint)
 				continue
 			}
 			_, present := network[nodeName]
@@ -88,7 +87,6 @@ func getLocalServerProperty(endpointServerPools EndpointServerPools, r *http.Req
 	}
 
 	props := madmin.ServerProperties{
-		State:    string(madmin.ItemInitializing),
 		Endpoint: addr,
 		Uptime:   UTCNow().Unix() - globalBootTime.Unix(),
 		Version:  Version,
@@ -120,7 +118,7 @@ func getLocalServerProperty(endpointServerPools EndpointServerPools, r *http.Req
 		config.EnvRootUser:          {},
 		config.EnvRootPassword:      {},
 		config.EnvMinIOSubnetAPIKey: {},
-		config.EnvKMSSecretKey:      {},
+		kms.EnvKMSSecretKey:         {},
 	}
 	for _, v := range os.Environ() {
 		if !strings.HasPrefix(v, "MINIO") && !strings.HasPrefix(v, "_MINIO") {
@@ -142,11 +140,13 @@ func getLocalServerProperty(endpointServerPools EndpointServerPools, r *http.Req
 	}
 
 	objLayer := newObjectLayerFn()
-	if objLayer != nil && !globalIsGateway {
-		// only need Disks information in server mode.
-		storageInfo, _ := objLayer.LocalStorageInfo(GlobalContext)
+	if objLayer != nil {
+		storageInfo := objLayer.LocalStorageInfo(GlobalContext)
 		props.State = string(madmin.ItemOnline)
 		props.Disks = storageInfo.Disks
+	} else {
+		props.State = string(madmin.ItemInitializing)
+		props.Disks = getOfflineDisks("", globalEndpoints)
 	}
 
 	return props

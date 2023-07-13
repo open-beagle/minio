@@ -21,7 +21,7 @@ import (
 	"context"
 	"time"
 
-	"github.com/minio/madmin-go"
+	"github.com/minio/madmin-go/v3"
 	"github.com/minio/minio/internal/disk"
 )
 
@@ -29,6 +29,7 @@ type collectMetricsOpts struct {
 	hosts map[string]struct{}
 	disks map[string]struct{}
 	jobID string
+	depID string
 }
 
 func collectLocalMetrics(types madmin.MetricType, opts collectMetricsOpts) (m madmin.RealtimeMetrics) {
@@ -65,7 +66,9 @@ func collectLocalMetrics(types madmin.MetricType, opts collectMetricsOpts) (m ma
 	if types.Contains(madmin.MetricsBatchJobs) {
 		m.Aggregated.BatchJobs = globalBatchJobsMetrics.report(opts.jobID)
 	}
-
+	if types.Contains(madmin.MetricsSiteResync) {
+		m.Aggregated.SiteResync = globalSiteResyncMetrics.report(opts.depID)
+	}
 	// Add types...
 
 	// ByHost is a shallow reference, so careful about sharing.
@@ -88,10 +91,8 @@ func collectLocalDisksMetrics(disks map[string]struct{}) map[string]madmin.DiskM
 		return metrics
 	}
 
-	// only need Disks information in server mode.
-	storageInfo, errs := objLayer.LocalStorageInfo(GlobalContext)
-
-	for i, d := range storageInfo.Disks {
+	storageInfo := objLayer.LocalStorageInfo(GlobalContext)
+	for _, d := range storageInfo.Disks {
 		if len(disks) != 0 {
 			_, ok := disks[d.Endpoint]
 			if !ok {
@@ -99,7 +100,7 @@ func collectLocalDisksMetrics(disks map[string]struct{}) map[string]madmin.DiskM
 			}
 		}
 
-		if errs[i] != nil {
+		if d.State != madmin.DriveStateOk && d.State != madmin.DriveStateUnformatted {
 			metrics[d.Endpoint] = madmin.DiskMetric{NDisks: 1, Offline: 1}
 			continue
 		}

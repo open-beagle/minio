@@ -31,9 +31,14 @@ func toObjectErr(err error, params ...string) error {
 	if err == nil {
 		return nil
 	}
-	if errors.Is(err, context.Canceled) {
+
+	// Unwarp the error first
+	err = unwrapAll(err)
+
+	if err == context.Canceled {
 		return context.Canceled
 	}
+
 	switch err.Error() {
 	case errVolumeNotFound.Error():
 		apiErr := BucketNotFound{}
@@ -424,16 +429,27 @@ func (e BucketRemoteTargetNotFound) Error() string {
 
 // RemoteTargetConnectionErr remote target connection failure.
 type RemoteTargetConnectionErr struct {
-	Err      error
-	Bucket   string
-	Endpoint string
+	Err       error
+	Bucket    string
+	Endpoint  string
+	AccessKey string
 }
 
 func (e RemoteTargetConnectionErr) Error() string {
 	if e.Bucket != "" {
-		return fmt.Sprintf("Remote service endpoint offline or target bucket/remote service credentials invalid: %s \n\t%s", e.Bucket, e.Err.Error())
+		return fmt.Sprintf("Remote service endpoint offline, target bucket: %s or remote service credentials: %s invalid \n\t%s", e.Bucket, e.AccessKey, e.Err.Error())
 	}
 	return fmt.Sprintf("Remote service endpoint %s not available\n\t%s", e.Endpoint, e.Err.Error())
+}
+
+// BucketRemoteIdenticalToSource remote already exists for this target type.
+type BucketRemoteIdenticalToSource struct {
+	GenericError
+	Endpoint string
+}
+
+func (e BucketRemoteIdenticalToSource) Error() string {
+	return fmt.Sprintf("Remote service endpoint %s is self referential to current cluster", e.Endpoint)
 }
 
 // BucketRemoteAlreadyExists remote already exists for this target type.
@@ -642,6 +658,15 @@ func (e InvalidETag) Error() string {
 	return "etag of the object has changed"
 }
 
+// BackendDown is returned for network errors
+type BackendDown struct {
+	Err string
+}
+
+func (e BackendDown) Error() string {
+	return e.Err
+}
+
 // NotImplemented If a feature is not implemented
 type NotImplemented struct {
 	Message string
@@ -658,19 +683,16 @@ func (e UnsupportedMetadata) Error() string {
 	return "Unsupported headers in Metadata"
 }
 
-// BackendDown is returned for network errors or if the gateway's backend is down.
-type BackendDown struct {
-	Err string
-}
-
-func (e BackendDown) Error() string {
-	return e.Err
-}
-
 // isErrBucketNotFound - Check if error type is BucketNotFound.
 func isErrBucketNotFound(err error) bool {
 	var bkNotFound BucketNotFound
 	return errors.As(err, &bkNotFound)
+}
+
+// isErrReadQuorum check if the error type is InsufficentReadQuorum
+func isErrReadQuorum(err error) bool {
+	var rquorum InsufficientReadQuorum
+	return errors.As(err, &rquorum)
 }
 
 // isErrObjectNotFound - Check if error type is ObjectNotFound.
@@ -711,5 +733,17 @@ func isErrMethodNotAllowed(err error) bool {
 
 func isErrInvalidRange(err error) bool {
 	_, ok := err.(InvalidRange)
+	return ok
+}
+
+// ReplicationPermissionCheck - Check if error type is ReplicationPermissionCheck.
+type ReplicationPermissionCheck struct{}
+
+func (e ReplicationPermissionCheck) Error() string {
+	return "Replication permission validation requests cannot be completed"
+}
+
+func isReplicationPermissionCheck(err error) bool {
+	_, ok := err.(ReplicationPermissionCheck)
 	return ok
 }

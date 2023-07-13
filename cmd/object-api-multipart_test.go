@@ -22,16 +22,21 @@ import (
 	"context"
 	"fmt"
 	"reflect"
+	"runtime"
 	"strings"
 	"testing"
 
 	"github.com/dustin/go-humanize"
 	"github.com/minio/minio/internal/config/storageclass"
 	"github.com/minio/minio/internal/hash"
+	"github.com/minio/minio/internal/ioutil"
 )
 
 // Wrapper for calling NewMultipartUpload tests for both Erasure multiple disks and single node setup.
 func TestObjectNewMultipartUpload(t *testing.T) {
+	if runtime.GOOS == globalWindowsOSName {
+		t.Skip()
+	}
 	ExecObjectLayerTest(t, testObjectNewMultipartUpload)
 }
 
@@ -56,7 +61,7 @@ func testObjectNewMultipartUpload(obj ObjectLayer, instanceType string, t TestEr
 	}
 
 	// Create bucket before intiating NewMultipartUpload.
-	err = obj.MakeBucketWithLocation(context.Background(), bucket, MakeBucketOptions{})
+	err = obj.MakeBucket(context.Background(), bucket, MakeBucketOptions{})
 	if err != nil {
 		// failed to create newbucket, abort.
 		t.Fatalf("%s : %s", instanceType, err.Error())
@@ -89,7 +94,7 @@ func testObjectAbortMultipartUpload(obj ObjectLayer, instanceType string, t Test
 	object := "minio-object"
 	opts := ObjectOptions{}
 	// Create bucket before intiating NewMultipartUpload.
-	err := obj.MakeBucketWithLocation(context.Background(), bucket, MakeBucketOptions{})
+	err := obj.MakeBucket(context.Background(), bucket, MakeBucketOptions{})
 	if err != nil {
 		// failed to create newbucket, abort.
 		t.Fatalf("%s : %s", instanceType, err.Error())
@@ -110,9 +115,18 @@ func testObjectAbortMultipartUpload(obj ObjectLayer, instanceType string, t Test
 		{"--", object, uploadID, BucketNotFound{}},
 		{"foo", object, uploadID, BucketNotFound{}},
 		{bucket, object, "foo-foo", InvalidUploadID{}},
-		{bucket, "\\", uploadID, InvalidUploadID{}},
 		{bucket, object, uploadID, nil},
 	}
+
+	if runtime.GOOS != globalWindowsOSName {
+		abortTestCases = append(abortTestCases, struct {
+			bucketName      string
+			objName         string
+			uploadID        string
+			expectedErrType error
+		}{bucket, "\\", uploadID, InvalidUploadID{}})
+	}
+
 	// Iterating over creatPartCases to generate multipart chunks.
 	for i, testCase := range abortTestCases {
 		err = obj.AbortMultipartUpload(context.Background(), testCase.bucketName, testCase.objName, testCase.uploadID, opts)
@@ -136,7 +150,7 @@ func testObjectAPIIsUploadIDExists(obj ObjectLayer, instanceType string, t TestE
 	object := "minio-object"
 
 	// Create bucket before intiating NewMultipartUpload.
-	err := obj.MakeBucketWithLocation(context.Background(), bucket, MakeBucketOptions{})
+	err := obj.MakeBucket(context.Background(), bucket, MakeBucketOptions{})
 	if err != nil {
 		// Failed to create newbucket, abort.
 		t.Fatalf("%s : %s", instanceType, err.Error())
@@ -168,7 +182,7 @@ func testObjectAPIPutObjectPart(obj ObjectLayer, instanceType string, t TestErrH
 	object := "minio-object"
 	opts := ObjectOptions{}
 	// Create bucket before intiating NewMultipartUpload.
-	err := obj.MakeBucketWithLocation(context.Background(), bucket, MakeBucketOptions{})
+	err := obj.MakeBucket(context.Background(), bucket, MakeBucketOptions{})
 	if err != nil {
 		// Failed to create newbucket, abort.
 		t.Fatalf("%s : %s", instanceType, err.Error())
@@ -181,7 +195,7 @@ func testObjectAPIPutObjectPart(obj ObjectLayer, instanceType string, t TestErrH
 	}
 	uploadID := res.UploadID
 	// Creating a dummy bucket for tests.
-	err = obj.MakeBucketWithLocation(context.Background(), "unused-bucket", MakeBucketOptions{})
+	err = obj.MakeBucket(context.Background(), "unused-bucket", MakeBucketOptions{})
 	if err != nil {
 		// Failed to create newbucket, abort.
 		t.Fatalf("%s : %s", instanceType, err.Error())
@@ -264,7 +278,7 @@ func testObjectAPIPutObjectPart(obj ObjectLayer, instanceType string, t TestErrH
 		// Input with size less than the size of actual data inside the reader.
 		{
 			bucketName: bucket, objName: object, uploadID: uploadID, PartID: 1, inputReaderData: "abcd", inputMd5: "900150983cd24fb0d6963f7d28e17f73", intputDataSize: int64(len("abcd") - 1),
-			expectedError: hash.BadDigest{ExpectedMD5: "900150983cd24fb0d6963f7d28e17f73", CalculatedMD5: "900150983cd24fb0d6963f7d28e17f72"},
+			expectedError: ioutil.ErrOverread,
 		},
 
 		// Test case - 16-19.
@@ -316,7 +330,7 @@ func testListMultipartUploads(obj ObjectLayer, instanceType string, t TestErrHan
 	// objectNames[0].
 	// uploadIds [0].
 	// Create bucket before initiating NewMultipartUpload.
-	err := obj.MakeBucketWithLocation(context.Background(), bucketNames[0], MakeBucketOptions{})
+	err := obj.MakeBucket(context.Background(), bucketNames[0], MakeBucketOptions{})
 	if err != nil {
 		// Failed to create newbucket, abort.
 		t.Fatalf("%s : %s", instanceType, err.Error())
@@ -334,7 +348,7 @@ func testListMultipartUploads(obj ObjectLayer, instanceType string, t TestErrHan
 	// objectNames[0].
 	// uploadIds [1-3].
 	// Bucket to test for mutiple upload Id's for a given object.
-	err = obj.MakeBucketWithLocation(context.Background(), bucketNames[1], MakeBucketOptions{})
+	err = obj.MakeBucket(context.Background(), bucketNames[1], MakeBucketOptions{})
 	if err != nil {
 		// Failed to create newbucket, abort.
 		t.Fatalf("%s : %s", instanceType, err.Error())
@@ -355,7 +369,7 @@ func testListMultipartUploads(obj ObjectLayer, instanceType string, t TestErrHan
 	// bucketnames[2].
 	// objectNames[0-2].
 	// uploadIds [4-9].
-	err = obj.MakeBucketWithLocation(context.Background(), bucketNames[2], MakeBucketOptions{})
+	err = obj.MakeBucket(context.Background(), bucketNames[2], MakeBucketOptions{})
 	if err != nil {
 		// Failed to create newbucket, abort.
 		t.Fatalf("%s : %s", instanceType, err.Error())
@@ -1051,9 +1065,10 @@ func testListMultipartUploads(obj ObjectLayer, instanceType string, t TestErrHan
 			fmt.Errorf("Invalid combination of uploadID marker '%s' and marker '%s'", "abc", "asia/europe/"), false,
 		},
 		{
-			bucketNames[0], "asia", "asia/europe", "abc", "", 0,
+			// Contains a base64 padding character
+			bucketNames[0], "asia", "asia/europe", "abc=", "", 0,
 			ListMultipartsInfo{},
-			fmt.Errorf("Malformed upload id %s", "abc"), false,
+			fmt.Errorf("Malformed upload id %s", "abc="), false,
 		},
 
 		// Setting up valid case of ListMultiPartUploads.
@@ -1183,20 +1198,20 @@ func testListObjectPartsDiskNotFound(obj ObjectLayer, instanceType string, disks
 	objectNames := []string{"minio-object-1.txt"}
 	uploadIDs := []string{}
 
-	globalStorageClass = storageclass.Config{
+	globalStorageClass.Update(storageclass.Config{
 		RRS: storageclass.StorageClass{
 			Parity: 2,
 		},
 		Standard: storageclass.StorageClass{
 			Parity: 4,
 		},
-	}
+	})
 
 	// bucketnames[0].
 	// objectNames[0].
 	// uploadIds [0].
 	// Create bucket before intiating NewMultipartUpload.
-	err := obj.MakeBucketWithLocation(context.Background(), bucketNames[0], MakeBucketOptions{})
+	err := obj.MakeBucket(context.Background(), bucketNames[0], MakeBucketOptions{})
 	if err != nil {
 		// Failed to create newbucket, abort.
 		t.Fatalf("%s : %s", instanceType, err.Error())
@@ -1440,7 +1455,7 @@ func testListObjectParts(obj ObjectLayer, instanceType string, t TestErrHandler)
 	// objectNames[0].
 	// uploadIds [0].
 	// Create bucket before intiating NewMultipartUpload.
-	err := obj.MakeBucketWithLocation(context.Background(), bucketNames[0], MakeBucketOptions{})
+	err := obj.MakeBucket(context.Background(), bucketNames[0], MakeBucketOptions{})
 	if err != nil {
 		// Failed to create newbucket, abort.
 		t.Fatalf("%s : %s", instanceType, err.Error())
@@ -1681,7 +1696,7 @@ func testObjectCompleteMultipartUpload(obj ObjectLayer, instanceType string, t T
 	// objectNames[0].
 	// uploadIds [0].
 	// Create bucket before intiating NewMultipartUpload.
-	err = obj.MakeBucketWithLocation(context.Background(), bucketNames[0], MakeBucketOptions{})
+	err = obj.MakeBucket(context.Background(), bucketNames[0], MakeBucketOptions{})
 	if err != nil {
 		// Failed to create newbucket, abort.
 		t.Fatalf("%s : %s", instanceType, err)

@@ -25,9 +25,8 @@ import (
 	"time"
 
 	jsoniter "github.com/json-iterator/go"
-	"github.com/minio/madmin-go"
+	"github.com/minio/madmin-go/v3"
 	"github.com/minio/minio-go/v7"
-	miniogo "github.com/minio/minio-go/v7"
 	"github.com/minio/minio-go/v7/pkg/credentials"
 	"github.com/minio/minio/internal/bucket/replication"
 	"github.com/minio/minio/internal/crypto"
@@ -99,7 +98,7 @@ func (sys *BucketTargetSys) heartBeat(ctx context.Context) {
 		select {
 		case <-hcTimer.C:
 			sys.hMutex.RLock()
-			var eps []madmin.ServerProperties
+			eps := make([]madmin.ServerProperties, 0, len(sys.hc))
 			for _, ep := range sys.hc {
 				eps = append(eps, madmin.ServerProperties{Endpoint: ep.Endpoint, Scheme: ep.Scheme})
 			}
@@ -107,16 +106,12 @@ func (sys *BucketTargetSys) heartBeat(ctx context.Context) {
 
 			if len(eps) > 0 {
 				cctx, cancel := context.WithTimeout(ctx, 30*time.Second)
-				m := map[string]epHealth{}
+				m := make(map[string]epHealth, len(eps))
 				for result := range sys.hcClient.Alive(cctx, madmin.AliveOpts{}, eps...) {
-					var online bool
-					if result.Error == nil {
-						online = result.Online
-					}
 					m[result.Endpoint.Host] = epHealth{
 						Endpoint: result.Endpoint.Host,
 						Scheme:   result.Endpoint.Scheme,
-						Online:   online,
+						Online:   result.Online,
 					}
 				}
 				cancel()
@@ -208,23 +203,23 @@ func (sys *BucketTargetSys) Delete(bucket string) {
 
 // SetTarget - sets a new minio-go client target for this bucket.
 func (sys *BucketTargetSys) SetTarget(ctx context.Context, bucket string, tgt *madmin.BucketTarget, update bool) error {
-	if globalIsGateway {
-		return nil
-	}
 	if !tgt.Type.IsValid() && !update {
 		return BucketRemoteArnTypeInvalid{Bucket: bucket}
 	}
 	clnt, err := sys.getRemoteTargetClient(tgt)
 	if err != nil {
-		return BucketRemoteTargetNotFound{Bucket: tgt.TargetBucket}
+		return BucketRemoteTargetNotFound{Bucket: tgt.TargetBucket, Err: err}
 	}
 	// validate if target credentials are ok
 	exists, err := clnt.BucketExists(ctx, tgt.TargetBucket)
 	if err != nil {
-		if minio.ToErrorResponse(err).Code == "NoSuchBucket" {
-			return BucketRemoteTargetNotFound{Bucket: tgt.TargetBucket}
+		switch minio.ToErrorResponse(err).Code {
+		case "NoSuchBucket":
+			return BucketRemoteTargetNotFound{Bucket: tgt.TargetBucket, Err: err}
+		case "AccessDenied":
+			return RemoteTargetConnectionErr{Bucket: tgt.TargetBucket, AccessKey: tgt.Credentials.AccessKey, Err: err}
 		}
-		return RemoteTargetConnectionErr{Bucket: tgt.TargetBucket, Err: err}
+		return RemoteTargetConnectionErr{Bucket: tgt.TargetBucket, AccessKey: tgt.Credentials.AccessKey, Err: err}
 	}
 	if !exists {
 		return BucketRemoteTargetNotFound{Bucket: tgt.TargetBucket}
@@ -235,7 +230,7 @@ func (sys *BucketTargetSys) SetTarget(ctx context.Context, bucket string, tgt *m
 		}
 		vcfg, err := clnt.GetBucketVersioning(ctx, tgt.TargetBucket)
 		if err != nil {
-			return RemoteTargetConnectionErr{Bucket: tgt.TargetBucket, Err: err}
+			return RemoteTargetConnectionErr{Bucket: tgt.TargetBucket, Err: err, AccessKey: tgt.Credentials.AccessKey}
 		}
 		if !vcfg.Enabled() {
 			return BucketRemoteTargetNotVersioned{Bucket: tgt.TargetBucket}
@@ -257,6 +252,10 @@ func (sys *BucketTargetSys) SetTarget(ctx context.Context, bucket string, tgt *m
 				found = true
 				continue
 			}
+			// fail if endpoint is already present in list of targets and not a matching ARN
+			if t.Endpoint == tgt.Endpoint {
+				return BucketRemoteAlreadyExists{Bucket: t.TargetBucket}
+			}
 		}
 		newtgts[idx] = t
 	}
@@ -266,29 +265,22 @@ func (sys *BucketTargetSys) SetTarget(ctx context.Context, bucket string, tgt *m
 
 	sys.targetsMap[bucket] = newtgts
 	sys.arnRemotesMap[tgt.Arn] = clnt
-	sys.updateBandwidthLimit(bucket, tgt.BandwidthLimit)
+	sys.updateBandwidthLimit(bucket, tgt.Arn, tgt.BandwidthLimit)
 	return nil
 }
 
-func (sys *BucketTargetSys) updateBandwidthLimit(bucket string, limit int64) {
-	if globalIsGateway {
-		return
-	}
+func (sys *BucketTargetSys) updateBandwidthLimit(bucket, arn string, limit int64) {
 	if limit == 0 {
-		globalBucketMonitor.DeleteBucket(bucket)
+		globalBucketMonitor.DeleteBucketThrottle(bucket, arn)
 		return
 	}
 	// Setup bandwidth throttling
 
-	globalBucketMonitor.SetBandwidthLimit(bucket, limit)
+	globalBucketMonitor.SetBandwidthLimit(bucket, arn, limit)
 }
 
 // RemoveTarget - removes a remote bucket target for this source bucket.
 func (sys *BucketTargetSys) RemoveTarget(ctx context.Context, bucket, arnStr string) error {
-	if globalIsGateway {
-		return nil
-	}
-
 	if arnStr == "" {
 		return BucketRemoteArnInvalid{Bucket: bucket}
 	}
@@ -336,7 +328,7 @@ func (sys *BucketTargetSys) RemoveTarget(ctx context.Context, bucket, arnStr str
 	}
 	sys.targetsMap[bucket] = targets
 	delete(sys.arnRemotesMap, arnStr)
-	sys.updateBandwidthLimit(bucket, 0)
+	sys.updateBandwidthLimit(bucket, arnStr, 0)
 	return nil
 }
 
@@ -406,7 +398,7 @@ func (sys *BucketTargetSys) UpdateAllTargets(bucket string, tgts *madmin.BucketT
 
 	// No need for more if not adding anything
 	if tgts == nil || tgts.Empty() {
-		sys.updateBandwidthLimit(bucket, 0)
+		globalBucketMonitor.DeleteBucket(bucket)
 		return
 	}
 
@@ -419,7 +411,7 @@ func (sys *BucketTargetSys) UpdateAllTargets(bucket string, tgts *madmin.BucketT
 			continue
 		}
 		sys.arnRemotesMap[tgt.Arn] = tgtClient
-		sys.updateBandwidthLimit(bucket, tgt.BandwidthLimit)
+		sys.updateBandwidthLimit(bucket, tgt.Arn, tgt.BandwidthLimit)
 	}
 	sys.targetsMap[bucket] = tgts.Targets
 }
@@ -442,7 +434,7 @@ func (sys *BucketTargetSys) set(bucket BucketInfo, meta BucketMetadata) {
 			continue
 		}
 		sys.arnRemotesMap[tgt.Arn] = tgtClient
-		sys.updateBandwidthLimit(bucket.Name, tgt.BandwidthLimit)
+		sys.updateBandwidthLimit(bucket.Name, tgt.Arn, tgt.BandwidthLimit)
 	}
 	sys.targetsMap[bucket.Name] = cfg.Targets
 }
@@ -452,7 +444,7 @@ func (sys *BucketTargetSys) getRemoteTargetClient(tcfg *madmin.BucketTarget) (*T
 	config := tcfg.Credentials
 	creds := credentials.NewStaticV4(config.AccessKey, config.SecretKey, "")
 
-	api, err := minio.New(tcfg.Endpoint, &miniogo.Options{
+	api, err := minio.New(tcfg.Endpoint, &minio.Options{
 		Creds:     creds,
 		Secure:    tcfg.Secure,
 		Region:    tcfg.Region,
@@ -461,6 +453,8 @@ func (sys *BucketTargetSys) getRemoteTargetClient(tcfg *madmin.BucketTarget) (*T
 	if err != nil {
 		return nil, err
 	}
+	api.SetAppInfo("minio-replication-target", ReleaseTag+" "+tcfg.Arn)
+
 	hcDuration := defaultHealthCheckDuration
 	if tcfg.HealthCheckDuration >= 1 { // require minimum health check duration of 1 sec.
 		hcDuration = tcfg.HealthCheckDuration
@@ -481,27 +475,50 @@ func (sys *BucketTargetSys) getRemoteTargetClient(tcfg *madmin.BucketTarget) (*T
 }
 
 // getRemoteARN gets existing ARN for an endpoint or generates a new one.
-func (sys *BucketTargetSys) getRemoteARN(bucket string, target *madmin.BucketTarget) string {
+func (sys *BucketTargetSys) getRemoteARN(bucket string, target *madmin.BucketTarget, deplID string) (arn string, exists bool) {
 	if target == nil {
-		return ""
+		return
 	}
 	tgts := sys.targetsMap[bucket]
 	for _, tgt := range tgts {
-		if tgt.Type == target.Type && tgt.TargetBucket == target.TargetBucket && target.URL().String() == tgt.URL().String() {
-			return tgt.Arn
+		if tgt.Type == target.Type &&
+			tgt.TargetBucket == target.TargetBucket &&
+			target.URL().String() == tgt.URL().String() &&
+			tgt.Credentials.AccessKey == target.Credentials.AccessKey {
+			return tgt.Arn, true
 		}
 	}
 	if !target.Type.IsValid() {
-		return ""
+		return
 	}
-	return generateARN(target)
+	return generateARN(target, deplID), false
+}
+
+// getRemoteARNForPeer returns the remote target for a peer site in site replication
+func (sys *BucketTargetSys) getRemoteARNForPeer(bucket string, peer madmin.PeerInfo) string {
+	tgts := sys.targetsMap[bucket]
+	for _, target := range tgts {
+		ep, _ := url.Parse(peer.Endpoint)
+		if target.SourceBucket == bucket &&
+			target.TargetBucket == bucket &&
+			target.Endpoint == ep.Host &&
+			target.Secure == (ep.Scheme == "https") &&
+			target.Type == madmin.ReplicationService {
+			return target.Arn
+		}
+	}
+	return ""
 }
 
 // generate ARN that is unique to this target type
-func generateARN(t *madmin.BucketTarget) string {
+func generateARN(t *madmin.BucketTarget, deplID string) string {
+	uuid := deplID
+	if uuid == "" {
+		uuid = mustGetUUID()
+	}
 	arn := madmin.ARN{
 		Type:   t.Type,
-		ID:     mustGetUUID(),
+		ID:     uuid,
 		Region: t.Region,
 		Bucket: t.TargetBucket,
 	}
@@ -543,7 +560,7 @@ func parseBucketTargetConfig(bucket string, cdata, cmetadata []byte) (*madmin.Bu
 
 // TargetClient is the struct for remote target client.
 type TargetClient struct {
-	*miniogo.Client
+	*minio.Client
 	healthCheckDuration time.Duration
 	Bucket              string // remote bucket target
 	replicateSync       bool

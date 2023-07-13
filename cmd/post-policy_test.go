@@ -27,6 +27,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strings"
 	"testing"
 	"time"
 
@@ -114,6 +115,65 @@ func newPostPolicyBytesV2(bucketName, objectKey string, expiration time.Time) []
 	return []byte(retStr)
 }
 
+// Wrapper
+func TestPostPolicyReservedBucketExploit(t *testing.T) {
+	ExecObjectLayerTestWithDirs(t, testPostPolicyReservedBucketExploit)
+}
+
+// testPostPolicyReservedBucketExploit is a test for the exploit fixed in PR
+// #16849
+func testPostPolicyReservedBucketExploit(obj ObjectLayer, instanceType string, dirs []string, t TestErrHandler) {
+	if err := newTestConfig(globalMinioDefaultRegion, obj); err != nil {
+		t.Fatalf("Initializing config.json failed")
+	}
+
+	// Register the API end points with Erasure/FS object layer.
+	apiRouter := initTestAPIEndPoints(obj, []string{"PostPolicy"})
+
+	credentials := globalActiveCred
+	bucketName := minioMetaBucket
+	objectName := "config/x"
+
+	// This exploit needs browser to be enabled.
+	if !globalBrowserEnabled {
+		globalBrowserEnabled = true
+		defer func() { globalBrowserEnabled = false }()
+	}
+
+	// initialize HTTP NewRecorder, this records any mutations to response writer inside the handler.
+	rec := httptest.NewRecorder()
+	req, perr := newPostRequestV4("", bucketName, objectName, []byte("pwned"), credentials.AccessKey, credentials.SecretKey)
+	if perr != nil {
+		t.Fatalf("Test %s: Failed to create HTTP request for PostPolicyHandler: <ERROR> %v", instanceType, perr)
+	}
+
+	contentTypeHdr := req.Header.Get("Content-Type")
+	contentTypeHdr = strings.Replace(contentTypeHdr, "multipart/form-data", "multipart/form-datA", 1)
+	req.Header.Set("Content-Type", contentTypeHdr)
+	req.Header.Set("User-Agent", "Mozilla")
+
+	// Since `apiRouter` satisfies `http.Handler` it has a ServeHTTP to execute the logic ofthe handler.
+	// Call the ServeHTTP to execute the handler.
+	apiRouter.ServeHTTP(rec, req)
+
+	ctx, cancel := context.WithCancel(GlobalContext)
+	defer cancel()
+
+	// Now check if we actually wrote to backend (regardless of the response
+	// returned by the server).
+	z := obj.(*erasureServerPools)
+	xl := z.serverPools[0].sets[0]
+	erasureDisks := xl.getDisks()
+	parts, errs := readAllFileInfo(ctx, erasureDisks, bucketName, objectName+"/upload.txt", "", false)
+	for i := range parts {
+		if errs[i] == nil {
+			if parts[i].Name == objectName+"/upload.txt" {
+				t.Errorf("Test %s: Failed to stop post policy handler from writing to minioMetaBucket", instanceType)
+			}
+		}
+	}
+}
+
 // Wrapper for calling TestPostPolicyBucketHandler tests for both Erasure multiple disks and single node setup.
 func TestPostPolicyBucketHandler(t *testing.T) {
 	ExecObjectLayerTest(t, testPostPolicyBucketHandler)
@@ -141,7 +201,7 @@ func testPostPolicyBucketHandler(obj ObjectLayer, instanceType string, t TestErr
 	// objectNames[0].
 	// uploadIds [0].
 	// Create bucket before initiating NewMultipartUpload.
-	err := obj.MakeBucketWithLocation(context.Background(), bucketName, MakeBucketOptions{})
+	err := obj.MakeBucket(context.Background(), bucketName, MakeBucketOptions{})
 	if err != nil {
 		// Failed to create newbucket, abort.
 		t.Fatalf("%s : %s", instanceType, err.Error())
@@ -460,7 +520,7 @@ func testPostPolicyBucketHandlerRedirect(obj ObjectLayer, instanceType string, t
 	curTime := UTCNow()
 	curTimePlus5Min := curTime.Add(time.Minute * 5)
 
-	err = obj.MakeBucketWithLocation(context.Background(), bucketName, MakeBucketOptions{})
+	err = obj.MakeBucket(context.Background(), bucketName, MakeBucketOptions{})
 	if err != nil {
 		// Failed to create newbucket, abort.
 		t.Fatalf("%s : %s", instanceType, err.Error())

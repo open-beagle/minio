@@ -25,13 +25,6 @@ import (
 var (
 	Help = config.HelpKVS{
 		config.HelpKV{
-			Key:         config.Enable,
-			Description: "set to 'on' to enable the logger webhook",
-			Optional:    true,
-			Type:        "on|off",
-			Sensitive:   false,
-		},
-		config.HelpKV{
 			Key:         Endpoint,
 			Description: `HTTP(s) endpoint e.g. "http://localhost:8080/minio/logs/server"`,
 			Type:        "url",
@@ -43,6 +36,7 @@ var (
 			Optional:    true,
 			Type:        "string",
 			Sensitive:   true,
+			Secret:      true,
 		},
 		config.HelpKV{
 			Key:         ClientCert,
@@ -65,6 +59,12 @@ var (
 			Type:        "number",
 		},
 		config.HelpKV{
+			Key:         Proxy,
+			Description: "proxy url endpoint e.g. http(s)://proxy",
+			Optional:    true,
+			Type:        "string",
+		},
+		config.HelpKV{
 			Key:         config.Comment,
 			Description: config.DefaultComment,
 			Optional:    true,
@@ -73,13 +73,6 @@ var (
 	}
 
 	HelpWebhook = config.HelpKVS{
-		config.HelpKV{
-			Key:         config.Enable,
-			Description: "set to 'on' to enable the audit logger",
-			Optional:    true,
-			Type:        "on|off",
-			Sensitive:   false,
-		},
 		config.HelpKV{
 			Key:         Endpoint,
 			Description: `HTTP(s) endpoint e.g. "http://localhost:8080/minio/logs/audit"`,
@@ -92,6 +85,7 @@ var (
 			Optional:    true,
 			Type:        "string",
 			Sensitive:   true,
+			Secret:      true,
 		},
 		config.HelpKV{
 			Key:         ClientCert,
@@ -123,13 +117,6 @@ var (
 
 	HelpKafka = config.HelpKVS{
 		config.HelpKV{
-			Key:         config.Enable,
-			Description: "set to 'on' to enable kafka audit logging",
-			Optional:    true,
-			Type:        "on|off",
-			Sensitive:   false,
-		},
-		config.HelpKV{
 			Key:         KafkaBrokers,
 			Description: "comma separated list of Kafka broker addresses",
 			Type:        "csv",
@@ -153,6 +140,7 @@ var (
 			Optional:    true,
 			Type:        "string",
 			Sensitive:   true,
+			Secret:      true,
 		},
 		config.HelpKV{
 			Key:         KafkaSASLMechanism,

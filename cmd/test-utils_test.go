@@ -58,7 +58,6 @@ import (
 
 	"github.com/fatih/color"
 
-	"github.com/gorilla/mux"
 	"github.com/minio/minio-go/v7/pkg/s3utils"
 	"github.com/minio/minio-go/v7/pkg/signer"
 	"github.com/minio/minio/internal/auth"
@@ -66,7 +65,7 @@ import (
 	"github.com/minio/minio/internal/crypto"
 	"github.com/minio/minio/internal/hash"
 	"github.com/minio/minio/internal/logger"
-	"github.com/minio/minio/internal/rest"
+	"github.com/minio/mux"
 	"github.com/minio/pkg/bucket/policy"
 )
 
@@ -112,7 +111,7 @@ func TestMain(m *testing.M) {
 	// Initialize globalConsoleSys system
 	globalConsoleSys = NewConsoleLogger(context.Background())
 
-	globalInternodeTransport = newInternodeHTTPTransport(nil, rest.DefaultTimeout)()
+	globalInternodeTransport = NewInternodeHTTPTransport()()
 
 	initHelp()
 
@@ -125,6 +124,8 @@ func TestMain(m *testing.M) {
 
 // concurrency level for certain parallel tests.
 const testConcurrencyLevel = 10
+
+const iso8601TimeFormat = "2006-01-02T15:04:05.000Z"
 
 // Excerpts from @lsegal - https://github.com/aws/aws-sdk-js/issues/659#issuecomment-120477258
 //
@@ -190,7 +191,7 @@ func prepareFS(ctx context.Context) (ObjectLayer, string, error) {
 	if err != nil {
 		return nil, "", err
 	}
-	obj, _, err := initObjectLayer(context.Background(), mustGetPoolEndpoints(fsDirs...))
+	obj, _, err := initObjectLayer(context.Background(), mustGetPoolEndpoints(0, fsDirs...))
 	if err != nil {
 		return nil, "", err
 	}
@@ -210,7 +211,7 @@ func prepareErasure(ctx context.Context, nDisks int) (ObjectLayer, []string, err
 	if err != nil {
 		return nil, nil, err
 	}
-	obj, _, err := initObjectLayer(ctx, mustGetPoolEndpoints(fsDirs...))
+	obj, _, err := initObjectLayer(ctx, mustGetPoolEndpoints(0, fsDirs...))
 	if err != nil {
 		removeRoots(fsDirs)
 		return nil, nil, err
@@ -221,19 +222,6 @@ func prepareErasure(ctx context.Context, nDisks int) (ObjectLayer, []string, err
 
 func prepareErasure16(ctx context.Context) (ObjectLayer, []string, error) {
 	return prepareErasure(ctx, 16)
-}
-
-// Initialize FS objects.
-func initFSObjects(disk string, t *testing.T) (obj ObjectLayer) {
-	obj, _, err := initObjectLayer(context.Background(), mustGetPoolEndpoints(disk))
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	newTestConfig(globalMinioDefaultRegion, obj)
-
-	initAllSubsystems(GlobalContext)
-	return obj
 }
 
 // TestErrHandler - Go testing.T satisfy this interface.
@@ -343,7 +331,7 @@ func initTestServerWithBackend(ctx context.Context, t TestErrHandler, testServer
 
 	testServer.Obj = objLayer
 	testServer.rawDiskPaths = disks
-	testServer.Disks = mustGetPoolEndpoints(disks...)
+	testServer.Disks = mustGetPoolEndpoints(0, disks...)
 	testServer.AccessKey = credentials.AccessKey
 	testServer.SecretKey = credentials.SecretKey
 
@@ -1476,9 +1464,9 @@ func getListenNotificationURL(endPoint, bucketName string, prefixes, suffixes, e
 }
 
 // getRandomDisks - Creates a slice of N random disks, each of the form - minio-XXX
-func getRandomDisks(N int) ([]string, error) {
+func getRandomDisks(n int) ([]string, error) {
 	var erasureDisks []string
-	for i := 0; i < N; i++ {
+	for i := 0; i < n; i++ {
 		path, err := os.MkdirTemp(globalTestTmpDir, "minio-")
 		if err != nil {
 			// Remove directories created so far.
@@ -1546,7 +1534,7 @@ func initAPIHandlerTest(ctx context.Context, obj ObjectLayer, endpoints []string
 	bucketName := getRandomBucketName()
 
 	// Create bucket.
-	err := obj.MakeBucketWithLocation(context.Background(), bucketName, MakeBucketOptions{})
+	err := obj.MakeBucket(context.Background(), bucketName, MakeBucketOptions{})
 	if err != nil {
 		// failed to create newbucket, return err.
 		return "", nil, err
@@ -1884,21 +1872,29 @@ func ExecObjectLayerTestWithDirs(t TestErrHandler, objTest objTestTypeWithDirs) 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
+	if localMetacacheMgr != nil {
+		localMetacacheMgr.deleteAll()
+	}
+
+	initAllSubsystems(ctx)
 	objLayer, fsDirs, err := prepareErasure16(ctx)
 	if err != nil {
 		t.Fatalf("Initialization of object layer failed for Erasure setup: %s", err)
 	}
-	defer objLayer.Shutdown(ctx)
-
-	// initialize the server and obtain the credentials and root.
-	// credentials are necessary to sign the HTTP request.
-	if err = newTestConfig(globalMinioDefaultRegion, objLayer); err != nil {
-		t.Fatal("Unexpected error", err)
-	}
+	setObjectLayer(objLayer)
+	initConfigSubsystem(ctx, objLayer)
+	globalIAMSys.Init(ctx, objLayer, globalEtcdClient, 2*time.Second)
 
 	// Executing the object layer tests for Erasure.
 	objTest(objLayer, ErasureTestStr, fsDirs, t)
-	defer removeRoots(fsDirs)
+
+	objLayer.Shutdown(context.Background())
+	if localMetacacheMgr != nil {
+		localMetacacheMgr.deleteAll()
+	}
+	setObjectLayer(newObjectLayerFn())
+	cancel()
+	removeRoots(fsDirs)
 }
 
 // ExecObjectLayerDiskAlteredTest - executes object layer tests while altering
@@ -1936,7 +1932,7 @@ func ExecObjectLayerStaleFilesTest(t *testing.T, objTest objTestStaleFilesType) 
 	if err != nil {
 		t.Fatalf("Initialization of drives for Erasure setup: %s", err)
 	}
-	objLayer, _, err := initObjectLayer(ctx, mustGetPoolEndpoints(erasureDisks...))
+	objLayer, _, err := initObjectLayer(ctx, mustGetPoolEndpoints(0, erasureDisks...))
 	if err != nil {
 		t.Fatalf("Initialization of object layer failed for Erasure setup: %s", err)
 	}
@@ -1999,10 +1995,10 @@ func registerBucketLevelFunc(bucket *mux.Router, api objectAPIHandlers, apiFunct
 			bucket.Methods(http.MethodPost).Path("/{object:.+}").HandlerFunc(api.NewMultipartUploadHandler).Queries("uploads", "")
 		case "CopyObjectPart":
 			// Register CopyObjectPart handler.
-			bucket.Methods(http.MethodPut).Path("/{object:.+}").HeadersRegexp("X-Amz-Copy-Source", ".*?(\\/|%2F).*?").HandlerFunc(api.CopyObjectPartHandler).Queries("partNumber", "{partNumber:[0-9]+}", "uploadId", "{uploadId:.*}")
+			bucket.Methods(http.MethodPut).Path("/{object:.+}").HeadersRegexp("X-Amz-Copy-Source", ".*?(\\/|%2F).*?").HandlerFunc(api.CopyObjectPartHandler).Queries("partNumber", "{partNumber:.*}", "uploadId", "{uploadId:.*}")
 		case "PutObjectPart":
 			// Register PutObjectPart handler.
-			bucket.Methods(http.MethodPut).Path("/{object:.+}").HandlerFunc(api.PutObjectPartHandler).Queries("partNumber", "{partNumber:[0-9]+}", "uploadId", "{uploadId:.*}")
+			bucket.Methods(http.MethodPut).Path("/{object:.+}").HandlerFunc(api.PutObjectPartHandler).Queries("partNumber", "{partNumber:.*}", "uploadId", "{uploadId:.*}")
 		case "ListObjectParts":
 			// Register ListObjectParts handler.
 			bucket.Methods(http.MethodGet).Path("/{object:.+}").HandlerFunc(api.ListObjectPartsHandler).Queries("uploadId", "{uploadId:.*}")
@@ -2074,11 +2070,11 @@ func initTestAPIEndPoints(objLayer ObjectLayer, apiFunctions []string) http.Hand
 	if len(apiFunctions) > 0 {
 		// Iterate the list of API functions requested for and register them in mux HTTP handler.
 		registerAPIFunctions(muxRouter, objLayer, apiFunctions...)
-		muxRouter.Use(globalHandlers...)
+		muxRouter.Use(globalMiddlewares...)
 		return muxRouter
 	}
 	registerAPIRouter(muxRouter)
-	muxRouter.Use(globalHandlers...)
+	muxRouter.Use(globalMiddlewares...)
 	return muxRouter
 }
 
@@ -2176,8 +2172,8 @@ func generateTLSCertKey(host string) ([]byte, []byte, error) {
 	return certOut.Bytes(), keyOut.Bytes(), nil
 }
 
-func mustGetPoolEndpoints(args ...string) EndpointServerPools {
-	endpoints := mustGetNewEndpoints(args...)
+func mustGetPoolEndpoints(poolIdx int, args ...string) EndpointServerPools {
+	endpoints := mustGetNewEndpoints(poolIdx, args...)
 	drivesPerSet := len(args)
 	setCount := 1
 	if len(args) >= 16 {
@@ -2192,8 +2188,11 @@ func mustGetPoolEndpoints(args ...string) EndpointServerPools {
 	}}
 }
 
-func mustGetNewEndpoints(args ...string) (endpoints Endpoints) {
+func mustGetNewEndpoints(poolIdx int, args ...string) (endpoints Endpoints) {
 	endpoints, err := NewEndpoints(args...)
+	for i := range endpoints {
+		endpoints[i].Pool = poolIdx
+	}
 	logger.FatalIf(err, "unable to create new endpoint list")
 	return endpoints
 }
@@ -2267,6 +2266,7 @@ func uploadTestObject(t *testing.T, apiRouter http.Handler, creds auth.Credentia
 	}
 
 	checkRespErr := func(rec *httptest.ResponseRecorder, exp int) {
+		t.Helper()
 		if rec.Code != exp {
 			b, err := io.ReadAll(rec.Body)
 			t.Fatalf("Expected: %v, Got: %v, Body: %s, err: %v", exp, rec.Code, string(b), err)

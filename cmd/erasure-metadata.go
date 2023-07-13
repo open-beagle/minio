@@ -23,28 +23,24 @@ import (
 	"fmt"
 	"net/http"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/minio/minio/internal/amztime"
 	"github.com/minio/minio/internal/bucket/replication"
+	"github.com/minio/minio/internal/crypto"
 	"github.com/minio/minio/internal/hash/sha256"
 	xhttp "github.com/minio/minio/internal/http"
 	"github.com/minio/minio/internal/logger"
-	"github.com/minio/minio/internal/sync/errgroup"
+	"github.com/minio/pkg/sync/errgroup"
+	"github.com/minio/sio"
 )
 
 // Object was stored with additional erasure codes due to degraded system at upload time
 const minIOErasureUpgraded = "x-minio-internal-erasure-upgraded"
 
 const erasureAlgorithm = "rs-vandermonde"
-
-// byObjectPartNumber is a collection satisfying sort.Interface.
-type byObjectPartNumber []ObjectPartInfo
-
-func (t byObjectPartNumber) Len() int           { return len(t) }
-func (t byObjectPartNumber) Swap(i, j int)      { t[i], t[j] = t[j], t[i] }
-func (t byObjectPartNumber) Less(i, j int) bool { return t[i].Number < t[j].Number }
 
 // AddChecksumInfo adds a checksum of a part.
 func (e *ErasureInfo) AddChecksumInfo(ckSumInfo ChecksumInfo) {
@@ -104,6 +100,52 @@ func (fi FileInfo) IsValid() bool {
 		correctIndexes)
 }
 
+func (fi FileInfo) checkMultipart() (int64, bool) {
+	if len(fi.Parts) == 0 {
+		return 0, false
+	}
+	if !crypto.IsMultiPart(fi.Metadata) {
+		return 0, false
+	}
+	var size int64
+	for _, part := range fi.Parts {
+		psize, err := sio.DecryptedSize(uint64(part.Size))
+		if err != nil {
+			return 0, false
+		}
+		size += int64(psize)
+	}
+
+	return size, len(extractETag(fi.Metadata)) != 32
+}
+
+// GetActualSize - returns the actual size of the stored object
+func (fi FileInfo) GetActualSize() (int64, error) {
+	if _, ok := fi.Metadata[ReservedMetadataPrefix+"compression"]; ok {
+		sizeStr, ok := fi.Metadata[ReservedMetadataPrefix+"actual-size"]
+		if !ok {
+			return -1, errInvalidDecompressedSize
+		}
+		size, err := strconv.ParseInt(sizeStr, 10, 64)
+		if err != nil {
+			return -1, errInvalidDecompressedSize
+		}
+		return size, nil
+	}
+	if _, ok := crypto.IsEncrypted(fi.Metadata); ok {
+		size, ok := fi.checkMultipart()
+		if !ok {
+			size, err := sio.DecryptedSize(uint64(fi.Size))
+			if err != nil {
+				err = errObjectTampered // assign correct error type
+			}
+			return int64(size), err
+		}
+		return size, nil
+	}
+	return fi.Size, nil
+}
+
 // ToObjectInfo - Converts metadata to object info.
 func (fi FileInfo) ToObjectInfo(bucket, object string, versioned bool) ObjectInfo {
 	object = decodeDirObject(object)
@@ -116,6 +158,8 @@ func (fi FileInfo) ToObjectInfo(bucket, object string, versioned bool) ObjectInf
 		IsDir:            HasSuffix(object, SlashSeparator),
 		Bucket:           bucket,
 		Name:             object,
+		ParityBlocks:     fi.Erasure.ParityBlocks,
+		DataBlocks:       fi.Erasure.DataBlocks,
 		VersionID:        versionID,
 		IsLatest:         fi.IsLatest,
 		DeleteMarker:     fi.Deleted,
@@ -147,9 +191,9 @@ func (fi FileInfo) ToObjectInfo(bucket, object string, versioned bool) ObjectInf
 	// Add replication status to the object info
 	objInfo.ReplicationStatusInternal = fi.ReplicationState.ReplicationStatusInternal
 	objInfo.VersionPurgeStatusInternal = fi.ReplicationState.VersionPurgeStatusInternal
-	objInfo.ReplicationStatus = fi.ReplicationState.CompositeReplicationStatus()
+	objInfo.ReplicationStatus = fi.ReplicationStatus()
+	objInfo.VersionPurgeStatus = fi.VersionPurgeStatus()
 
-	objInfo.VersionPurgeStatus = fi.ReplicationState.CompositeVersionPurgeStatus()
 	objInfo.TransitionedObject = TransitionedObject{
 		Name:        fi.TransitionedObjName,
 		VersionID:   fi.TransitionVersionID,
@@ -168,13 +212,14 @@ func (fi FileInfo) ToObjectInfo(bucket, object string, versioned bool) ObjectInf
 	objInfo.Parts = fi.Parts
 
 	// Update storage class
-	if sc, ok := fi.Metadata[xhttp.AmzStorageClass]; ok {
+	if fi.TransitionTier != "" {
+		objInfo.StorageClass = fi.TransitionTier
+	} else if sc, ok := fi.Metadata[xhttp.AmzStorageClass]; ok {
 		objInfo.StorageClass = sc
 	} else {
 		objInfo.StorageClass = globalMinioDefaultStorageClass
 	}
 
-	objInfo.VersionPurgeStatus = fi.VersionPurgeStatus()
 	// set restore status for transitioned object
 	restoreHdr, ok := fi.Metadata[xhttp.AmzRestore]
 	if ok {
@@ -184,6 +229,7 @@ func (fi FileInfo) ToObjectInfo(bucket, object string, versioned bool) ObjectInf
 		}
 	}
 	objInfo.Checksum = fi.Checksum
+	objInfo.Inlined = fi.InlineData()
 	// Success.
 	return objInfo
 }
@@ -257,7 +303,7 @@ func (fi *FileInfo) AddObjectPart(partNumber int, partETag string, partSize, act
 	fi.Parts = append(fi.Parts, partInfo)
 
 	// Parts in FileInfo should be in sorted order by part number.
-	sort.Sort(byObjectPartNumber(fi.Parts))
+	sort.Slice(fi.Parts, func(i, j int) bool { return fi.Parts[i].Number < fi.Parts[j].Number })
 }
 
 // ObjectToPartOffset - translate offset of an object to offset of its individual part.
@@ -282,7 +328,7 @@ func (fi FileInfo) ObjectToPartOffset(ctx context.Context, offset int64) (partIn
 	return 0, 0, InvalidRange{}
 }
 
-func findFileInfoInQuorum(ctx context.Context, metaArr []FileInfo, modTime time.Time, quorum int) (FileInfo, error) {
+func findFileInfoInQuorum(ctx context.Context, metaArr []FileInfo, modTime time.Time, etag string, quorum int) (FileInfo, error) {
 	// with less quorum return error.
 	if quorum < 1 {
 		return FileInfo{}, errErasureReadQuorum
@@ -290,12 +336,21 @@ func findFileInfoInQuorum(ctx context.Context, metaArr []FileInfo, modTime time.
 	metaHashes := make([]string, len(metaArr))
 	h := sha256.New()
 	for i, meta := range metaArr {
-		if meta.IsValid() && meta.ModTime.Equal(modTime) {
+		if !meta.IsValid() {
+			continue
+		}
+		etagOnly := modTime.Equal(timeSentinel) && (etag != "" && etag == meta.Metadata["etag"])
+		mtimeValid := meta.ModTime.Equal(modTime)
+		if mtimeValid || etagOnly {
 			fmt.Fprintf(h, "%v", meta.XLV1)
-			fmt.Fprintf(h, "%v", meta.GetDataDir())
+			if !etagOnly {
+				// Verify dataDir is same only when mtime is valid and etag is not considered.
+				fmt.Fprintf(h, "%v", meta.GetDataDir())
+			}
 			for _, part := range meta.Parts {
 				fmt.Fprintf(h, "part.%d", part.Number)
 			}
+			fmt.Fprintf(h, "%v+%v", meta.Erasure.DataBlocks, meta.Erasure.ParityBlocks)
 			fmt.Fprintf(h, "%v", meta.Erasure.Distribution)
 
 			// ILM transition fields
@@ -362,8 +417,8 @@ func pickValidDiskTimeWithQuorum(metaArr []FileInfo, quorum int) time.Time {
 
 // pickValidFileInfo - picks one valid FileInfo content and returns from a
 // slice of FileInfo.
-func pickValidFileInfo(ctx context.Context, metaArr []FileInfo, modTime time.Time, quorum int) (FileInfo, error) {
-	return findFileInfoInQuorum(ctx, metaArr, modTime, quorum)
+func pickValidFileInfo(ctx context.Context, metaArr []FileInfo, modTime time.Time, etag string, quorum int) (FileInfo, error) {
+	return findFileInfoInQuorum(ctx, metaArr, modTime, etag, quorum)
 }
 
 // writeUniqueFileInfo - writes unique `xl.meta` content for each disk concurrently.
@@ -394,22 +449,35 @@ func writeUniqueFileInfo(ctx context.Context, disks []StorageAPI, bucket, prefix
 	return evalDisks(disks, mErrs), err
 }
 
-func commonParity(parities []int) int {
+func commonParity(parities []int, defaultParityCount int) int {
+	N := len(parities)
+
 	occMap := make(map[int]int)
 	for _, p := range parities {
 		occMap[p]++
 	}
 
-	var maxOcc, commonParity int
-
+	var maxOcc, cparity int
 	for parity, occ := range occMap {
 		if parity == -1 {
 			// Ignore non defined parity
 			continue
 		}
-		if occ >= maxOcc {
+
+		readQuorum := N - parity
+		if defaultParityCount > 0 && parity == 0 {
+			// In this case, parity == 0 implies that this object version is a
+			// delete marker
+			readQuorum = N/2 + 1
+		}
+		if occ < readQuorum {
+			// Ignore this parity since we don't have enough shards for read quorum
+			continue
+		}
+
+		if occ > maxOcc {
 			maxOcc = occ
-			commonParity = parity
+			cparity = parity
 		}
 	}
 
@@ -417,7 +485,7 @@ func commonParity(parities []int) int {
 		// Did not found anything useful
 		return -1
 	}
-	return commonParity
+	return cparity
 }
 
 func listObjectParities(partsMetadata []FileInfo, errs []error) (parities []int) {
@@ -427,7 +495,15 @@ func listObjectParities(partsMetadata []FileInfo, errs []error) (parities []int)
 			parities[index] = -1
 			continue
 		}
-		parities[index] = metadata.Erasure.ParityBlocks
+		if !metadata.IsValid() {
+			parities[index] = -1
+			continue
+		}
+		if metadata.Deleted {
+			parities[index] = len(partsMetadata) / 2
+		} else {
+			parities[index] = metadata.Erasure.ParityBlocks
+		}
 	}
 	return
 }
@@ -454,8 +530,7 @@ func objectQuorumFromMeta(ctx context.Context, partsMetaData []FileInfo, errs []
 	}
 
 	parities := listObjectParities(partsMetaData, errs)
-	parityBlocks := commonParity(parities)
-
+	parityBlocks := commonParity(parities, defaultParityCount)
 	if parityBlocks < 0 {
 		return -1, -1, errErasureReadQuorum
 	}
@@ -532,6 +607,11 @@ func (fi *FileInfo) VersionPurgeStatus() VersionPurgeStatusType {
 	return fi.ReplicationState.CompositeVersionPurgeStatus()
 }
 
+// ReplicationStatus returns overall version replication status for this object version across targets
+func (fi *FileInfo) ReplicationStatus() replication.StatusType {
+	return fi.ReplicationState.CompositeReplicationStatus()
+}
+
 // DeleteMarkerReplicationStatus returns overall replication status for this delete marker version across targets
 func (fi *FileInfo) DeleteMarkerReplicationStatus() replication.StatusType {
 	if fi.Deleted {
@@ -555,11 +635,9 @@ func getInternalReplicationState(m map[string]string) ReplicationState {
 	for k, v := range m {
 		switch {
 		case equals(k, ReservedMetadataPrefixLower+ReplicationTimestamp):
-			tm, _ := time.Parse(http.TimeFormat, v)
-			d.ReplicationTimeStamp = tm
+			d.ReplicaTimeStamp, _ = amztime.ParseReplicationTS(v)
 		case equals(k, ReservedMetadataPrefixLower+ReplicaTimestamp):
-			tm, _ := time.Parse(http.TimeFormat, v)
-			d.ReplicaTimeStamp = tm
+			d.ReplicaTimeStamp, _ = amztime.ParseReplicationTS(v)
 		case equals(k, ReservedMetadataPrefixLower+ReplicaStatus):
 			d.ReplicaStatus = replication.StatusType(v)
 		case equals(k, ReservedMetadataPrefixLower+ReplicationStatus):

@@ -86,8 +86,6 @@ chmod +x minio
 ./minio server /data
 ```
 
-Replace ``/data`` with the path to the drive or directory in which you want MinIO to store data.
-
 The following table lists supported architectures. Replace the `wget` URL with the architecture for your Linux host.
 
 | Architecture                   | URL                                                        |
@@ -125,7 +123,7 @@ You can also connect using any S3-compatible tool, such as the MinIO Client `mc`
 
 ## Install from Source
 
-Use the following commands to compile and run a standalone MinIO server from source. Source installation is only intended for developers and advanced users. If you do not have a working Golang environment, please follow [How to install Golang](https://golang.org/doc/install). Minimum version required is [go1.18](https://golang.org/dl/#stable)
+Use the following commands to compile and run a standalone MinIO server from source. Source installation is only intended for developers and advanced users. If you do not have a working Golang environment, please follow [How to install Golang](https://golang.org/doc/install). Minimum version required is [go1.19](https://golang.org/dl/#stable)
 
 ```sh
 go install github.com/minio/minio@latest

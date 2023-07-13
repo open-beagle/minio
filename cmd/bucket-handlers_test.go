@@ -657,11 +657,15 @@ func testAPIDeleteMultipleObjectsHandler(obj ObjectLayer, instanceType, bucketNa
 ) {
 	var err error
 
-	contentBytes := []byte("hello")
 	sha256sum := ""
 	var objectNames []string
 	for i := 0; i < 10; i++ {
+		contentBytes := []byte("hello")
 		objectName := "test-object-" + strconv.Itoa(i)
+		if i == 0 {
+			objectName += "/"
+			contentBytes = []byte{}
+		}
 		// uploading the object.
 		_, err = obj.PutObject(GlobalContext, bucketName, objectName, mustGetPutObjReader(t, bytes.NewReader(contentBytes), int64(len(contentBytes)), "", sha256sum), ObjectOptions{})
 		// if object upload fails stop the test.
@@ -673,6 +677,7 @@ func testAPIDeleteMultipleObjectsHandler(obj ObjectLayer, instanceType, bucketNa
 		objectNames = append(objectNames, objectName)
 	}
 
+	contentBytes := []byte("hello")
 	for _, name := range []string{"private/object", "public/object"} {
 		// Uploading the object with retention enabled
 		_, err = obj.PutObject(GlobalContext, bucketName, name, mustGetPutObjReader(t, bytes.NewReader(contentBytes), int64(len(contentBytes)), "", sha256sum), ObjectOptions{})
@@ -742,8 +747,13 @@ func testAPIDeleteMultipleObjectsHandler(obj ObjectLayer, instanceType, bucketNa
 
 	deletedObjects := make([]DeletedObject, len(requestList[0].Objects))
 	for i := range requestList[0].Objects {
+		var vid string
+		if isDirObject(requestList[0].Objects[i].ObjectName) {
+			vid = ""
+		}
 		deletedObjects[i] = DeletedObject{
 			ObjectName: requestList[0].Objects[i].ObjectName,
+			VersionID:  vid,
 		}
 	}
 
@@ -753,9 +763,14 @@ func testAPIDeleteMultipleObjectsHandler(obj ObjectLayer, instanceType, bucketNa
 	successRequest1 := encodeResponse(requestList[1])
 
 	deletedObjects = make([]DeletedObject, len(requestList[1].Objects))
-	for i := range requestList[0].Objects {
+	for i := range requestList[1].Objects {
+		var vid string
+		if isDirObject(requestList[0].Objects[i].ObjectName) {
+			vid = ""
+		}
 		deletedObjects[i] = DeletedObject{
 			ObjectName: requestList[1].Objects[i].ObjectName,
+			VersionID:  vid,
 		}
 	}
 
@@ -793,9 +808,9 @@ func testAPIDeleteMultipleObjectsHandler(obj ObjectLayer, instanceType, bucketNa
 		expectedContent    []byte
 		expectedRespStatus int
 	}{
-		// Test case - 1.
+		// Test case - 0.
 		// Delete objects with invalid access key.
-		{
+		0: {
 			bucket:             bucketName,
 			objects:            successRequest0,
 			accessKey:          "Invalid-AccessID",
@@ -803,9 +818,19 @@ func testAPIDeleteMultipleObjectsHandler(obj ObjectLayer, instanceType, bucketNa
 			expectedContent:    nil,
 			expectedRespStatus: http.StatusForbidden,
 		},
-		// Test case - 2.
+		// Test case - 1.
 		// Delete valid objects with quiet flag off.
-		{
+		1: {
+			bucket:             bucketName,
+			objects:            successRequest0,
+			accessKey:          credentials.AccessKey,
+			secretKey:          credentials.SecretKey,
+			expectedContent:    encodedSuccessResponse0,
+			expectedRespStatus: http.StatusOK,
+		},
+		// Test case - 2.
+		// Delete deleted objects with quiet flag off.
+		2: {
 			bucket:             bucketName,
 			objects:            successRequest0,
 			accessKey:          credentials.AccessKey,
@@ -815,7 +840,7 @@ func testAPIDeleteMultipleObjectsHandler(obj ObjectLayer, instanceType, bucketNa
 		},
 		// Test case - 3.
 		// Delete valid objects with quiet flag on.
-		{
+		3: {
 			bucket:             bucketName,
 			objects:            successRequest1,
 			accessKey:          credentials.AccessKey,
@@ -825,7 +850,7 @@ func testAPIDeleteMultipleObjectsHandler(obj ObjectLayer, instanceType, bucketNa
 		},
 		// Test case - 4.
 		// Delete previously deleted objects.
-		{
+		4: {
 			bucket:             bucketName,
 			objects:            successRequest1,
 			accessKey:          credentials.AccessKey,
@@ -836,7 +861,7 @@ func testAPIDeleteMultipleObjectsHandler(obj ObjectLayer, instanceType, bucketNa
 		// Test case - 5.
 		// Anonymous user access denied response
 		// Currently anonymous users cannot delete multiple objects in MinIO server
-		{
+		5: {
 			bucket:             bucketName,
 			objects:            anonRequest,
 			accessKey:          "",
@@ -847,7 +872,7 @@ func testAPIDeleteMultipleObjectsHandler(obj ObjectLayer, instanceType, bucketNa
 		// Test case - 6.
 		// Anonymous user has access to some public folder, issue removing with
 		// another private object as well
-		{
+		6: {
 			bucket:             bucketName,
 			objects:            anonRequestWithPartialPublicAccess,
 			accessKey:          "",
@@ -881,19 +906,19 @@ func testAPIDeleteMultipleObjectsHandler(obj ObjectLayer, instanceType, bucketNa
 		apiRouter.ServeHTTP(rec, req)
 		// Assert the response code with the expected status.
 		if rec.Code != testCase.expectedRespStatus {
-			t.Errorf("Test %d: MinIO %s: Expected the response status to be `%d`, but instead found `%d`", i+1, instanceType, testCase.expectedRespStatus, rec.Code)
+			t.Errorf("Test %d: MinIO %s: Expected the response status to be `%d`, but instead found `%d`", i, instanceType, testCase.expectedRespStatus, rec.Code)
 		}
 
 		// read the response body.
 		actualContent, err = io.ReadAll(rec.Body)
 		if err != nil {
-			t.Fatalf("Test %d : MinIO %s: Failed parsing response body: <ERROR> %v", i+1, instanceType, err)
+			t.Fatalf("Test %d : MinIO %s: Failed parsing response body: <ERROR> %v", i, instanceType, err)
 		}
 
 		// Verify whether the bucket obtained object is same as the one created.
 		if testCase.expectedContent != nil && !bytes.Equal(testCase.expectedContent, actualContent) {
 			t.Log(string(testCase.expectedContent), string(actualContent))
-			t.Errorf("Test %d : MinIO %s: Object content differs from expected value.", i+1, instanceType)
+			t.Errorf("Test %d : MinIO %s: Object content differs from expected value.", i, instanceType)
 		}
 	}
 

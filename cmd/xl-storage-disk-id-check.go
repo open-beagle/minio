@@ -23,13 +23,14 @@ import (
 	"fmt"
 	"io"
 	"math/rand"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
-	"github.com/minio/madmin-go"
+	"github.com/minio/madmin-go/v3"
 	"github.com/minio/minio/internal/logger"
 	"github.com/minio/pkg/env"
 )
@@ -65,6 +66,8 @@ const (
 	storageMetricReadAll
 	storageMetricStatInfoFile
 	storageMetricReadMultiple
+	storageMetricDeleteAbandonedParts
+	storageMetricDiskInfo
 
 	// .... add more
 
@@ -103,28 +106,57 @@ func (p *xlStorageDiskIDCheck) getMetrics() DiskMetrics {
 	return m.(DiskMetrics)
 }
 
+// lockedLastMinuteLatency accumulates totals lockless for each second.
 type lockedLastMinuteLatency struct {
-	sync.Mutex
+	cachedSec int64
+	cached    atomic.Pointer[AccElem]
+	mu        sync.Mutex
+	init      sync.Once
 	lastMinuteLatency
 }
 
 func (e *lockedLastMinuteLatency) add(value time.Duration) {
-	e.Lock()
-	defer e.Unlock()
-	e.lastMinuteLatency.add(value)
+	e.addSize(value, 0)
 }
 
 // addSize will add a duration and size.
 func (e *lockedLastMinuteLatency) addSize(value time.Duration, sz int64) {
-	e.Lock()
-	defer e.Unlock()
-	e.lastMinuteLatency.addSize(value, sz)
+	// alloc on every call, so we have a clean entry to swap in.
+	t := time.Now().Unix()
+	e.init.Do(func() {
+		e.cached.Store(&AccElem{})
+		atomic.StoreInt64(&e.cachedSec, t)
+	})
+	acc := e.cached.Load()
+	if lastT := atomic.LoadInt64(&e.cachedSec); lastT != t {
+		// Check if lastT was changed by someone else.
+		if atomic.CompareAndSwapInt64(&e.cachedSec, lastT, t) {
+			// Now we swap in a new.
+			newAcc := &AccElem{}
+			old := e.cached.Swap(newAcc)
+			var a AccElem
+			a.Size = atomic.LoadInt64(&old.Size)
+			a.Total = atomic.LoadInt64(&old.Total)
+			a.N = atomic.LoadInt64(&old.N)
+			e.mu.Lock()
+			e.lastMinuteLatency.addAll(t-1, a)
+			e.mu.Unlock()
+			acc = newAcc
+		} else {
+			// We may be able to grab the new accumulator by yielding.
+			runtime.Gosched()
+			acc = e.cached.Load()
+		}
+	}
+	atomic.AddInt64(&acc.N, 1)
+	atomic.AddInt64(&acc.Total, int64(value))
+	atomic.AddInt64(&acc.Size, sz)
 }
 
 // total returns the total call count and latency for the last minute.
 func (e *lockedLastMinuteLatency) total() AccElem {
-	e.Lock()
-	defer e.Unlock()
+	e.mu.Lock()
+	defer e.mu.Unlock()
 	return e.lastMinuteLatency.getTotal()
 }
 
@@ -173,10 +205,12 @@ func (p *xlStorageDiskIDCheck) Healing() *healingTracker {
 
 func (p *xlStorageDiskIDCheck) NSScanner(ctx context.Context, cache dataUsageCache, updates chan<- dataUsageEntry, scanMode madmin.HealScanMode) (dataUsageCache, error) {
 	if contextCanceled(ctx) {
+		close(updates)
 		return dataUsageCache{}, ctx.Err()
 	}
 
 	if err := p.checkDiskStale(); err != nil {
+		close(updates)
 		return dataUsageCache{}, err
 	}
 	return p.storage.NSScanner(ctx, cache, updates, scanMode)
@@ -224,6 +258,9 @@ func (p *xlStorageDiskIDCheck) DiskInfo(ctx context.Context) (info DiskInfo, err
 	if contextCanceled(ctx) {
 		return DiskInfo{}, ctx.Err()
 	}
+
+	si := p.updateStorageMetrics(storageMetricDiskInfo)
+	defer si(&err)
 
 	info, err = p.storage.DiskInfo(ctx)
 	if err != nil {
@@ -526,7 +563,19 @@ func (p *xlStorageDiskIDCheck) ReadMultiple(ctx context.Context, req ReadMultipl
 	return p.storage.ReadMultiple(ctx, req, resp)
 }
 
-func storageTrace(s storageMetric, startTime time.Time, duration time.Duration, path string) madmin.TraceInfo {
+// CleanAbandonedData will read metadata of the object on disk
+// and delete any data directories and inline data that isn't referenced in metadata.
+func (p *xlStorageDiskIDCheck) CleanAbandonedData(ctx context.Context, volume string, path string) error {
+	ctx, done, err := p.TrackDiskHealth(ctx, storageMetricDeleteAbandonedParts, volume, path)
+	if err != nil {
+		return err
+	}
+	defer done(&err)
+
+	return p.storage.CleanAbandonedData(ctx, volume, path)
+}
+
+func storageTrace(s storageMetric, startTime time.Time, duration time.Duration, path string, err string) madmin.TraceInfo {
 	return madmin.TraceInfo{
 		TraceType: madmin.TraceStorage,
 		Time:      startTime,
@@ -534,10 +583,11 @@ func storageTrace(s storageMetric, startTime time.Time, duration time.Duration, 
 		FuncName:  "storage." + s.String(),
 		Duration:  duration,
 		Path:      path,
+		Error:     err,
 	}
 }
 
-func scannerTrace(s scannerMetric, startTime time.Time, duration time.Duration, path string) madmin.TraceInfo {
+func scannerTrace(s scannerMetric, startTime time.Time, duration time.Duration, path string, custom map[string]string) madmin.TraceInfo {
 	return madmin.TraceInfo{
 		TraceType: madmin.TraceScanner,
 		Time:      startTime,
@@ -545,6 +595,7 @@ func scannerTrace(s scannerMetric, startTime time.Time, duration time.Duration, 
 		FuncName:  "scanner." + s.String(),
 		Duration:  duration,
 		Path:      path,
+		Custom:    custom,
 	}
 }
 
@@ -552,15 +603,19 @@ func scannerTrace(s scannerMetric, startTime time.Time, duration time.Duration, 
 func (p *xlStorageDiskIDCheck) updateStorageMetrics(s storageMetric, paths ...string) func(err *error) {
 	startTime := time.Now()
 	trace := globalTrace.NumSubscribers(madmin.TraceStorage) > 0
-	return func(err *error) {
+	return func(errp *error) {
 		duration := time.Since(startTime)
 
 		atomic.AddUint64(&p.apiCalls[s], 1)
 		p.apiLatencies[s].add(duration)
 
-		paths = append([]string{p.String()}, paths...)
 		if trace {
-			globalTrace.Publish(storageTrace(s, startTime, duration, strings.Join(paths, " ")))
+			var errStr string
+			if errp != nil && *errp != nil {
+				errStr = (*errp).Error()
+			}
+			paths = append([]string{p.String()}, paths...)
+			globalTrace.Publish(storageTrace(s, startTime, duration, strings.Join(paths, " "), errStr))
 		}
 	}
 }
@@ -574,12 +629,20 @@ const (
 // for local and (incoming) remote disk ops respectively.
 var diskMaxConcurrent = 512
 
+// diskStartChecking is a threshold above which we will start to check
+// the state of disks.
+var diskStartChecking = 32
+
 func init() {
 	s := env.Get("_MINIO_DISK_MAX_CONCURRENT", "512")
 	diskMaxConcurrent, _ = strconv.Atoi(s)
 	if diskMaxConcurrent <= 0 {
 		logger.Info("invalid _MINIO_DISK_MAX_CONCURRENT value: %s, defaulting to '512'", s)
 		diskMaxConcurrent = 512
+	}
+	diskStartChecking = 16 + diskMaxConcurrent/8
+	if diskStartChecking > diskMaxConcurrent {
+		diskStartChecking = diskMaxConcurrent
 	}
 }
 
@@ -653,8 +716,8 @@ func (p *xlStorageDiskIDCheck) TrackDiskHealth(ctx context.Context, s storageMet
 	}
 
 	// Return early if disk is faulty already.
-	if atomic.LoadInt32(&p.health.status) == diskHealthFaulty {
-		return ctx, done, errFaultyDisk
+	if err := p.checkHealth(ctx); err != nil {
+		return ctx, done, err
 	}
 
 	// Verify if the disk is not stale
@@ -737,7 +800,7 @@ func (p *xlStorageDiskIDCheck) checkHealth(ctx context.Context) (err error) {
 		return errFaultyDisk
 	}
 	// Check if there are tokens.
-	if len(p.health.tokens) > 0 {
+	if diskMaxConcurrent-len(p.health.tokens) < diskStartChecking {
 		return nil
 	}
 
@@ -756,7 +819,7 @@ func (p *xlStorageDiskIDCheck) checkHealth(ctx context.Context) (err error) {
 	t = time.Since(time.Unix(0, atomic.LoadInt64(&p.health.lastSuccess)))
 	if t > maxTimeSinceLastSuccess {
 		if atomic.CompareAndSwapInt32(&p.health.status, diskHealthOK, diskHealthFaulty) {
-			logger.LogAlwaysIf(ctx, fmt.Errorf("taking drive %s offline, time since last response %v", p.storage.String(), t.Round(time.Millisecond)))
+			logger.LogAlwaysIf(ctx, fmt.Errorf("node(%s): taking drive %s offline, time since last response %v", globalLocalNodeName, p.storage.String(), t.Round(time.Millisecond)))
 			go p.monitorDiskStatus()
 		}
 		return errFaultyDisk
@@ -788,7 +851,7 @@ func (p *xlStorageDiskIDCheck) monitorDiskStatus() {
 			Force:     false,
 		})
 		if err == nil {
-			logger.Info("Able to read+write+delete, bringing drive %s online. Drive was offline for %s.", p.storage.String(),
+			logger.Info("node(%s): Read/Write/Delete successful, bringing drive %s online. Drive was offline for %s.", globalLocalNodeName, p.storage.String(),
 				time.Since(time.Unix(0, atomic.LoadInt64(&p.health.lastSuccess))))
 			atomic.StoreInt32(&p.health.status, diskHealthOK)
 			return

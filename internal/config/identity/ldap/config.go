@@ -23,7 +23,7 @@ import (
 	"sort"
 	"time"
 
-	"github.com/minio/madmin-go"
+	"github.com/minio/madmin-go/v3"
 	"github.com/minio/minio/internal/config"
 	"github.com/minio/pkg/ldap"
 )
@@ -62,6 +62,7 @@ func (l *Config) Clone() Config {
 // LDAP keys and envs.
 const (
 	ServerAddr         = "server_addr"
+	SRVRecordName      = "srv_record_name"
 	LookupBindDN       = "lookup_bind_dn"
 	LookupBindPassword = "lookup_bind_password"
 	UserDNSearchBaseDN = "user_dn_search_base_dn"
@@ -73,6 +74,7 @@ const (
 	ServerStartTLS     = "server_starttls"
 
 	EnvServerAddr         = "MINIO_IDENTITY_LDAP_SERVER_ADDR"
+	EnvSRVRecordName      = "MINIO_IDENTITY_LDAP_SRV_RECORD_NAME"
 	EnvTLSSkipVerify      = "MINIO_IDENTITY_LDAP_TLS_SKIP_VERIFY"
 	EnvServerInsecure     = "MINIO_IDENTITY_LDAP_SERVER_INSECURE"
 	EnvServerStartTLS     = "MINIO_IDENTITY_LDAP_SERVER_STARTTLS"
@@ -97,7 +99,15 @@ var removedKeys = []string{
 var (
 	DefaultKVS = config.KVS{
 		config.KV{
+			Key:   config.Enable,
+			Value: "",
+		},
+		config.KV{
 			Key:   ServerAddr,
+			Value: "",
+		},
+		config.KV{
+			Key:   SRVRecordName,
 			Value: "",
 		},
 		config.KV{
@@ -164,7 +174,7 @@ func Lookup(s config.Config, rootCAs *x509.CertPool) (l Config, err error) {
 	getCfgVal := func(cfgParam string) string {
 		// As parameters are already validated, we skip checking
 		// if the config param was found.
-		val, _ := s.ResolveConfigParam(config.IdentityLDAPSubSys, config.Default, cfgParam)
+		val, _, _ := s.ResolveConfigParam(config.IdentityLDAPSubSys, config.Default, cfgParam, false)
 		return val
 	}
 
@@ -173,10 +183,21 @@ func Lookup(s config.Config, rootCAs *x509.CertPool) (l Config, err error) {
 		return l, nil
 	}
 	l.LDAP = ldap.Config{
-		Enabled:    true,
-		RootCAs:    rootCAs,
-		ServerAddr: ldapServer,
+		Enabled:       true,
+		RootCAs:       rootCAs,
+		ServerAddr:    ldapServer,
+		SRVRecordName: getCfgVal(SRVRecordName),
 	}
+
+	// Parse explicitly enable=on/off flag. If not set, defaults to `true`
+	// because ServerAddr is set.
+	if v := getCfgVal(config.Enable); v != "" {
+		l.LDAP.Enabled, err = config.ParseBool(v)
+		if err != nil {
+			return l, err
+		}
+	}
+
 	l.stsExpiryDuration = defaultLDAPExpiry
 
 	// LDAP connection configuration
@@ -251,7 +272,7 @@ func (l *Config) GetConfigInfo(s config.Config, cfgName string) ([]madmin.IDPCfg
 	if cfgName != madmin.Default {
 		return nil, ErrProviderConfigNotFound
 	}
-	kvsrcs, err := s.GetResolvedConfigParams(config.IdentityLDAPSubSys, cfgName)
+	kvsrcs, err := s.GetResolvedConfigParams(config.IdentityLDAPSubSys, cfgName, true)
 	if err != nil {
 		return nil, err
 	}

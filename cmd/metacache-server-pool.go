@@ -28,7 +28,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/minio/minio/internal/bucket/lifecycle"
 	"github.com/minio/minio/internal/logger"
 )
 
@@ -96,7 +95,9 @@ func (z *erasureServerPools) listPath(ctx context.Context, o *listPathOptions) (
 
 	// Decode and get the optional list id from the marker.
 	o.parseMarker()
-	o.BaseDir = baseDirFromPrefix(o.Prefix)
+	if o.BaseDir == "" {
+		o.BaseDir = baseDirFromPrefix(o.Prefix)
+	}
 	o.Transient = o.Transient || isReservedOrInvalidBucket(o.Bucket, false)
 	o.SetFilter()
 	if o.Transient {
@@ -155,9 +156,6 @@ func (z *erasureServerPools) listPath(ctx context.Context, o *listPathOptions) (
 						return
 					case <-t.C:
 						meta.lastHandout = time.Now()
-						if rpc == nil {
-							meta, _ = localMetacacheMgr.updateCacheEntry(meta)
-						}
 						meta, _ = rpc.UpdateMetacacheListing(ctx, meta)
 					}
 				}(*c)
@@ -212,10 +210,6 @@ func (z *erasureServerPools) listPath(ctx context.Context, o *listPathOptions) (
 			}
 		}()
 		o.ID = ""
-
-		if err != nil {
-			logger.LogIf(ctx, fmt.Errorf("Resuming listing from drives failed %w, proceeding to do raw listing", err))
-		}
 	}
 
 	// Do listing in-place.
@@ -256,248 +250,6 @@ func (z *erasureServerPools) listPath(ctx context.Context, o *listPathOptions) (
 		return entries, io.EOF
 	}
 	return entries, nil
-}
-
-// listPath will return the requested entries.
-// If no more entries are in the listing io.EOF is returned,
-// otherwise nil or an unexpected error is returned.
-// The listPathOptions given will be checked and modified internally.
-// Required important fields are Bucket, Prefix, Separator.
-// Other important fields are Limit, Marker.
-// List ID always derived from the Marker.
-func (es *erasureSingle) listPath(ctx context.Context, o *listPathOptions) (entries metaCacheEntriesSorted, err error) {
-	if err := checkListObjsArgs(ctx, o.Bucket, o.Prefix, o.Marker, es); err != nil {
-		return entries, err
-	}
-
-	// Marker is set validate pre-condition.
-	if o.Marker != "" && o.Prefix != "" {
-		// Marker not common with prefix is not implemented. Send an empty response
-		if !HasPrefix(o.Marker, o.Prefix) {
-			return entries, io.EOF
-		}
-	}
-
-	// With max keys of zero we have reached eof, return right here.
-	if o.Limit == 0 {
-		return entries, io.EOF
-	}
-
-	// For delimiter and prefix as '/' we do not list anything at all
-	// along // with the prefix. On a flat namespace with 'prefix'
-	// as '/' we don't have any entries, since all the keys are
-	// of form 'keyName/...'
-	if strings.HasPrefix(o.Prefix, SlashSeparator) {
-		return entries, io.EOF
-	}
-
-	// If delimiter is slashSeparator we must return directories of
-	// the non-recursive scan unless explicitly requested.
-	o.IncludeDirectories = o.Separator == slashSeparator
-	if (o.Separator == slashSeparator || o.Separator == "") && !o.Recursive {
-		o.Recursive = o.Separator != slashSeparator
-		o.Separator = slashSeparator
-	} else {
-		// Default is recursive, if delimiter is set then list non recursive.
-		o.Recursive = true
-	}
-
-	// Decode and get the optional list id from the marker.
-	o.parseMarker()
-	o.BaseDir = baseDirFromPrefix(o.Prefix)
-	o.Transient = o.Transient || isReservedOrInvalidBucket(o.Bucket, false)
-	o.SetFilter()
-	if o.Transient {
-		o.Create = false
-	}
-
-	// We have 2 cases:
-	// 1) Cold listing, just list.
-	// 2) Returning, but with no id. Start async listing.
-	// 3) Returning, with ID, stream from list.
-	//
-	// If we don't have a list id we must ask the server if it has a cache or create a new.
-	if o.ID != "" && !o.Transient {
-		resp := localMetacacheMgr.getBucket(ctx, o.Bucket).findCache(*o)
-		c := &resp
-		if c.fileNotFound {
-			// No cache found, no entries found.
-			return entries, io.EOF
-		}
-		if c.status == scanStateError || c.status == scanStateNone {
-			o.ID = ""
-			o.Create = false
-			o.debugln("scan status", c.status, " - waiting a roundtrip to create")
-		} else {
-			// Continue listing
-			o.ID = c.id
-			go func(meta metacache) {
-				// Continuously update while we wait.
-				t := time.NewTicker(metacacheMaxClientWait / 10)
-				defer t.Stop()
-				select {
-				case <-ctx.Done():
-					// Request is done, stop updating.
-					return
-				case <-t.C:
-					meta.lastHandout = time.Now()
-					meta, _ = localMetacacheMgr.updateCacheEntry(meta)
-				}
-			}(*c)
-		}
-
-		// We have an existing list ID, continue streaming.
-		if o.Create {
-			o.debugln("Creating", o)
-			entries, err = es.listAndSave(ctx, o)
-			if err == nil || err == io.EOF {
-				return entries, err
-			}
-			entries.truncate(0)
-		} else {
-			o.debugln("Resuming", o)
-			entries, err = es.streamMetadataParts(ctx, *o)
-			entries.reuse = true // We read from stream and are not sharing results.
-			if err == nil {
-				return entries, nil
-			}
-		}
-		if IsErr(err, []error{
-			nil,
-			context.Canceled,
-			context.DeadlineExceeded,
-			// io.EOF is expected and should be returned but no need to log it.
-			io.EOF,
-		}...) {
-			// Expected good errors we don't need to return error.
-			return entries, err
-		}
-		entries.truncate(0)
-		o.ID = ""
-		if err != nil {
-			if !(isErrObjectNotFound(err) || errors.Is(err, IncompleteBody{}) || isErrVersionNotFound(err)) {
-				logger.LogIf(ctx, fmt.Errorf("Resuming listing from drives failed %w, proceeding to do raw listing", err))
-			}
-		}
-	}
-
-	// Do listing in-place.
-	// Create output for our results.
-	// Create filter for results.
-	o.debugln("Raw List", o)
-	filterCh := make(chan metaCacheEntry, o.Limit)
-	listCtx, cancelList := context.WithCancel(ctx)
-	filteredResults := o.gatherResults(listCtx, filterCh)
-	var wg sync.WaitGroup
-	wg.Add(1)
-	var listErr error
-
-	go func(o listPathOptions) {
-		defer wg.Done()
-		o.Limit = 0
-		listErr = es.listMerged(listCtx, o, filterCh)
-		o.debugln("listMerged returned with", listErr)
-	}(*o)
-
-	entries, err = filteredResults()
-	cancelList()
-	wg.Wait()
-	if listErr != nil && !errors.Is(listErr, context.Canceled) {
-		return entries, listErr
-	}
-	entries.reuse = true
-	truncated := entries.len() > o.Limit || err == nil
-	entries.truncate(o.Limit)
-	if !o.Transient && truncated {
-		if o.ID == "" {
-			entries.listID = mustGetUUID()
-		} else {
-			entries.listID = o.ID
-		}
-	}
-	if !truncated {
-		return entries, io.EOF
-	}
-	return entries, nil
-}
-
-// listMerged will list across all sets and return a merged results stream.
-// The result channel is closed when no more results are expected.
-func (es *erasureSingle) listMerged(ctx context.Context, o listPathOptions, results chan<- metaCacheEntry) error {
-	var mu sync.Mutex
-	var wg sync.WaitGroup
-	var listErr error
-	var inputs []chan metaCacheEntry
-
-	innerResults := make(chan metaCacheEntry, 100)
-	inputs = append(inputs, innerResults)
-
-	mu.Lock()
-	listCtx, cancelList := context.WithCancel(ctx)
-	defer cancelList()
-
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		err := es.listPathInner(listCtx, o, innerResults)
-		mu.Lock()
-		defer mu.Unlock()
-		listErr = err
-	}()
-	mu.Unlock()
-
-	// Do lifecycle filtering.
-	if o.Lifecycle != nil || o.Replication.Config != nil {
-		filterIn := make(chan metaCacheEntry, 10)
-		go applyBucketActions(ctx, o, filterIn, results)
-		// Replace results.
-		results = filterIn
-	}
-
-	// Gather results to a single channel.
-	err := mergeEntryChannels(ctx, inputs, results, func(existing, other *metaCacheEntry) (replace bool) {
-		// Pick object over directory
-		if existing.isDir() && !other.isDir() {
-			return true
-		}
-		if !existing.isDir() && other.isDir() {
-			return false
-		}
-		eMeta, err := existing.xlmeta()
-		if err != nil {
-			return true
-		}
-		oMeta, err := other.xlmeta()
-		if err != nil {
-			return false
-		}
-		// Replace if modtime is newer
-		if !oMeta.latestModtime().Equal(oMeta.latestModtime()) {
-			return oMeta.latestModtime().After(eMeta.latestModtime())
-		}
-		// Use NumVersions as a final tiebreaker.
-		return len(oMeta.versions) > len(eMeta.versions)
-	})
-
-	cancelList()
-	wg.Wait()
-	if err != nil {
-		return err
-	}
-	if listErr != nil {
-		if contextCanceled(ctx) {
-			return nil
-		}
-		if listErr.Error() == io.EOF.Error() {
-			return nil
-		}
-		logger.LogIf(ctx, listErr)
-		return listErr
-	}
-	if contextCanceled(ctx) {
-		return ctx.Err()
-	}
-	return nil
 }
 
 // listMerged will list across all sets and return a merged results stream.
@@ -541,29 +293,8 @@ func (z *erasureServerPools) listMerged(ctx context.Context, o listPathOptions, 
 	}
 
 	// Gather results to a single channel.
-	err := mergeEntryChannels(ctx, inputs, results, func(existing, other *metaCacheEntry) (replace bool) {
-		// Pick object over directory
-		if existing.isDir() && !other.isDir() {
-			return true
-		}
-		if !existing.isDir() && other.isDir() {
-			return false
-		}
-		eMeta, err := existing.xlmeta()
-		if err != nil {
-			return true
-		}
-		oMeta, err := other.xlmeta()
-		if err != nil {
-			return false
-		}
-		// Replace if modtime is newer
-		if !oMeta.latestModtime().Equal(oMeta.latestModtime()) {
-			return oMeta.latestModtime().After(eMeta.latestModtime())
-		}
-		// Use NumVersions as a final tiebreaker.
-		return len(oMeta.versions) > len(eMeta.versions)
-	})
+	// Quorum is one since we are merging across sets.
+	err := mergeEntryChannels(ctx, inputs, results, 1)
 
 	cancelList()
 	wg.Wait()
@@ -580,11 +311,11 @@ func (z *erasureServerPools) listMerged(ctx context.Context, o listPathOptions, 
 	}
 
 	for _, err := range errs {
-		if err == nil || contextCanceled(ctx) {
-			allAtEOF = false
+		if errors.Is(err, io.EOF) {
 			continue
 		}
-		if err.Error() == io.EOF.Error() {
+		if err == nil || contextCanceled(ctx) || errors.Is(err, context.Canceled) {
+			allAtEOF = false
 			continue
 		}
 		logger.LogIf(ctx, err)
@@ -605,7 +336,6 @@ func (z *erasureServerPools) listMerged(ctx context.Context, o listPathOptions, 
 func applyBucketActions(ctx context.Context, o listPathOptions, in <-chan metaCacheEntry, out chan<- metaCacheEntry) {
 	defer close(out)
 
-	vcfg, _ := globalBucketVersioningSys.Get(o.Bucket)
 	for {
 		var obj metaCacheEntry
 		var ok bool
@@ -618,101 +348,63 @@ func applyBucketActions(ctx context.Context, o listPathOptions, in <-chan metaCa
 			}
 		}
 
-		fi, err := obj.fileInfo(o.Bucket)
+		var skip bool
+
+		versioned := o.Versioning != nil && o.Versioning.Versioned(obj.name)
+
+		// skip latest object from listing only for regular
+		// listObjects calls, versioned based listing cannot
+		// filter out between versions 'obj' cannot be truncated
+		// in such a manner, so look for skipping an object only
+		// for regular ListObjects() call only.
+		if !o.Versioned {
+			fi, err := obj.fileInfo(o.Bucket)
+			if err != nil {
+				continue
+			}
+
+			objInfo := fi.ToObjectInfo(o.Bucket, obj.name, versioned)
+			if o.Lifecycle != nil {
+				act := evalActionFromLifecycle(ctx, *o.Lifecycle, o.Retention, objInfo).Action
+				skip = act.Delete()
+				if act.DeleteRestored() {
+					// do not skip DeleteRestored* actions
+					skip = false
+				}
+			}
+		}
+
+		// Skip entry only if needed via ILM, skipping is never true for versioned listing.
+		if !skip {
+			select {
+			case <-ctx.Done():
+				return
+			case out <- obj:
+			}
+		}
+
+		fiv, err := obj.fileInfoVersions(o.Bucket)
 		if err != nil {
 			continue
 		}
 
-		versioned := vcfg != nil && vcfg.Versioned(obj.name)
+		// Expire all versions if needed, if not attempt to queue for replication.
+		for _, version := range fiv.Versions {
+			objInfo := version.ToObjectInfo(o.Bucket, obj.name, versioned)
 
-		objInfo := fi.ToObjectInfo(o.Bucket, obj.name, versioned)
-		if o.Lifecycle != nil {
-			evt := evalActionFromLifecycle(ctx, *o.Lifecycle, o.Retention, objInfo)
-			switch evt.Action {
-			case lifecycle.DeleteVersionAction, lifecycle.DeleteAction:
-				globalExpiryState.enqueueByDays(objInfo, false, evt.Action == lifecycle.DeleteVersionAction)
-				// Skip this entry.
-				continue
-			case lifecycle.DeleteRestoredAction, lifecycle.DeleteRestoredVersionAction:
-				globalExpiryState.enqueueByDays(objInfo, true, evt.Action == lifecycle.DeleteRestoredVersionAction)
-				// Skip this entry.
-				continue
+			if o.Lifecycle != nil {
+				evt := evalActionFromLifecycle(ctx, *o.Lifecycle, o.Retention, objInfo)
+				if evt.Action.Delete() {
+					globalExpiryState.enqueueByDays(objInfo, evt, lcEventSrc_s3ListObjects)
+					if !evt.Action.DeleteRestored() {
+						continue
+					} // queue version for replication upon expired restored copies if needed.
+				}
 			}
-		}
-		select {
-		case <-ctx.Done():
-			return
-		case out <- obj:
+
 			queueReplicationHeal(ctx, o.Bucket, objInfo, o.Replication)
 		}
 	}
-}
-
-func (es *erasureSingle) listAndSave(ctx context.Context, o *listPathOptions) (entries metaCacheEntriesSorted, err error) {
-	// Use ID as the object name...
-	o.pool = 0
-	o.set = 0
-	saver := es
-
-	// Disconnect from call above, but cancel on exit.
-	listCtx, cancel := context.WithCancel(GlobalContext)
-	saveCh := make(chan metaCacheEntry, metacacheBlockSize)
-	inCh := make(chan metaCacheEntry, metacacheBlockSize)
-	outCh := make(chan metaCacheEntry, o.Limit)
-
-	filteredResults := o.gatherResults(ctx, outCh)
-
-	mc := o.newMetacache()
-	meta := metaCacheRPC{meta: &mc, cancel: cancel, rpc: globalNotificationSys.restClientFromHash(pathJoin(o.Bucket, o.Prefix)), o: *o}
-
-	// Save listing...
-	go func() {
-		if err := saver.saveMetaCacheStream(listCtx, &meta, saveCh); err != nil {
-			meta.setErr(err.Error())
-		}
-		cancel()
-	}()
-
-	// Do listing...
-	go func(o listPathOptions) {
-		err := es.listMerged(listCtx, o, inCh)
-		if err != nil {
-			meta.setErr(err.Error())
-		}
-		o.debugln("listAndSave: listing", o.ID, "finished with ", err)
-	}(*o)
-
-	// Keep track of when we return since we no longer have to send entries to output.
-	var funcReturned bool
-	var funcReturnedMu sync.Mutex
-	defer func() {
-		funcReturnedMu.Lock()
-		funcReturned = true
-		funcReturnedMu.Unlock()
-	}()
-	// Write listing to results and saver.
-	go func() {
-		var returned bool
-		for entry := range inCh {
-			if !returned {
-				funcReturnedMu.Lock()
-				returned = funcReturned
-				funcReturnedMu.Unlock()
-				outCh <- entry
-				if returned {
-					close(outCh)
-				}
-			}
-			entry.reusable = returned
-			saveCh <- entry
-		}
-		if !returned {
-			close(outCh)
-		}
-		close(saveCh)
-	}()
-
-	return filteredResults()
 }
 
 func (z *erasureServerPools) listAndSave(ctx context.Context, o *listPathOptions) (entries metaCacheEntriesSorted, err error) {

@@ -24,8 +24,7 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/minio/madmin-go"
-	"github.com/minio/minio/internal/auth"
+	"github.com/minio/madmin-go/v3"
 	"github.com/minio/minio/internal/config"
 	"github.com/minio/minio/internal/config/api"
 	"github.com/minio/minio/internal/config/cache"
@@ -38,6 +37,7 @@ import (
 	"github.com/minio/minio/internal/config/identity/openid"
 	idplugin "github.com/minio/minio/internal/config/identity/plugin"
 	xtls "github.com/minio/minio/internal/config/identity/tls"
+	"github.com/minio/minio/internal/config/lambda"
 	"github.com/minio/minio/internal/config/notify"
 	"github.com/minio/minio/internal/config/policy/opa"
 	polplugin "github.com/minio/minio/internal/config/policy/plugin"
@@ -65,7 +65,6 @@ func initHelp() {
 		config.SiteSubSys:           config.DefaultSiteKVS,
 		config.RegionSubSys:         config.DefaultRegionKVS,
 		config.APISubSys:            api.DefaultKVS,
-		config.CredentialsSubSys:    config.DefaultCredentialKVS,
 		config.LoggerWebhookSubSys:  logger.DefaultLoggerWebhookKVS,
 		config.AuditWebhookSubSys:   logger.DefaultAuditWebhookKVS,
 		config.AuditKafkaSubSys:     logger.DefaultAuditKafkaKVS,
@@ -74,6 +73,9 @@ func initHelp() {
 		config.CallhomeSubSys:       callhome.DefaultKVS,
 	}
 	for k, v := range notify.DefaultNotificationKVS {
+		kvs[k] = v
+	}
+	for k, v := range lambda.DefaultLambdaKVS {
 		kvs[k] = v
 	}
 	if globalIsErasure {
@@ -85,20 +87,32 @@ func initHelp() {
 	// Captures help for each sub-system
 	helpSubSys := config.HelpKVS{
 		config.HelpKV{
+			Key:         config.SubnetSubSys,
+			Type:        "string",
+			Description: "register the cluster to MinIO SUBNET",
+			Optional:    true,
+		},
+		config.HelpKV{
+			Key:         config.CallhomeSubSys,
+			Type:        "string",
+			Description: "enable callhome to MinIO SUBNET",
+			Optional:    true,
+		},
+		config.HelpKV{
 			Key:         config.SiteSubSys,
 			Description: "label the server and its location",
 		},
 		config.HelpKV{
-			Key:         config.CacheSubSys,
-			Description: "add caching storage tier",
+			Key:         config.APISubSys,
+			Description: "manage global HTTP API call specific features, such as throttling, authentication types, etc.",
+		},
+		config.HelpKV{
+			Key:         config.ScannerSubSys,
+			Description: "manage namespace scanning for usage calculation, lifecycle, healing and more",
 		},
 		config.HelpKV{
 			Key:         config.CompressionSubSys,
 			Description: "enable server side compression of objects",
-		},
-		config.HelpKV{
-			Key:         config.EtcdSubSys,
-			Description: "federate multiple clusters for IAM and Bucket DNS",
 		},
 		config.HelpKV{
 			Key:             config.IdentityOpenIDSubSys,
@@ -120,14 +134,6 @@ func initHelp() {
 		config.HelpKV{
 			Key:         config.PolicyPluginSubSys,
 			Description: "enable Access Management Plugin for policy enforcement",
-		},
-		config.HelpKV{
-			Key:         config.APISubSys,
-			Description: "manage global HTTP API call specific features, such as throttling, authentication types, etc.",
-		},
-		config.HelpKV{
-			Key:         config.ScannerSubSys,
-			Description: "manage namespace scanning for usage calculation, lifecycle, healing and more",
 		},
 		config.HelpKV{
 			Key:             config.LoggerWebhookSubSys,
@@ -195,16 +201,17 @@ func initHelp() {
 			MultipleTargets: true,
 		},
 		config.HelpKV{
-			Key:         config.SubnetSubSys,
-			Type:        "string",
-			Description: "set subnet config for the cluster e.g. api key",
-			Optional:    true,
+			Key:             config.LambdaWebhookSubSys,
+			Description:     "manage remote lambda functions",
+			MultipleTargets: true,
 		},
 		config.HelpKV{
-			Key:         config.CallhomeSubSys,
-			Type:        "string",
-			Description: "enable callhome for the cluster",
-			Optional:    true,
+			Key:         config.EtcdSubSys,
+			Description: "persist IAM assets externally to etcd",
+		},
+		config.HelpKV{
+			Key:         config.CacheSubSys,
+			Description: "[DEPRECATED] add caching storage tier",
 		},
 	}
 
@@ -248,6 +255,7 @@ func initHelp() {
 		config.NotifyRedisSubSys:    notify.HelpRedis,
 		config.NotifyWebhookSubSys:  notify.HelpWebhook,
 		config.NotifyESSubSys:       notify.HelpES,
+		config.LambdaWebhookSubSys:  lambda.HelpWebhook,
 		config.SubnetSubSys:         subnet.HelpSubnet,
 		config.CallhomeSubSys:       callhome.HelpCallhome,
 	}
@@ -275,7 +283,7 @@ var (
 	globalServerConfigMu sync.RWMutex
 )
 
-func validateSubSysConfig(s config.Config, subSys string, objAPI ObjectLayer) error {
+func validateSubSysConfig(ctx context.Context, s config.Config, subSys string, objAPI ObjectLayer) error {
 	switch subSys {
 	case config.SiteSubSys:
 		if _, err := config.LookupSite(s[config.SiteSubSys][config.Default], s[config.RegionSubSys][config.Default]); err != nil {
@@ -299,15 +307,8 @@ func validateSubSysConfig(s config.Config, subSys string, objAPI ObjectLayer) er
 			return err
 		}
 	case config.CompressionSubSys:
-		compCfg, err := compress.LookupConfig(s[config.CompressionSubSys][config.Default])
-		if err != nil {
+		if _, err := compress.LookupConfig(s[config.CompressionSubSys][config.Default]); err != nil {
 			return err
-		}
-
-		if objAPI != nil {
-			if compCfg.Enabled && !objAPI.IsCompressionSupported() {
-				return fmt.Errorf("Backend does not support compression")
-			}
 		}
 	case config.HealSubSys:
 		if _, err := heal.LookupConfig(s[config.HealSubSys][config.Default]); err != nil {
@@ -331,7 +332,7 @@ func validateSubSysConfig(s config.Config, subSys string, objAPI ObjectLayer) er
 		}
 	case config.IdentityOpenIDSubSys:
 		if _, err := openid.LookupConfig(s,
-			NewGatewayHTTPTransport(), xhttp.DrainBody, globalSite.Region); err != nil {
+			NewHTTPTransport(), xhttp.DrainBody, globalSite.Region); err != nil {
 			return err
 		}
 	case config.IdentityLDAPSubSys:
@@ -352,7 +353,7 @@ func validateSubSysConfig(s config.Config, subSys string, objAPI ObjectLayer) er
 		}
 	case config.IdentityPluginSubSys:
 		if _, err := idplugin.LookupConfig(s[config.IdentityPluginSubSys][config.Default],
-			NewGatewayHTTPTransport(), xhttp.DrainBody, globalSite.Region); err != nil {
+			NewHTTPTransport(), xhttp.DrainBody, globalSite.Region); err != nil {
 			return err
 		}
 	case config.SubnetSubSys:
@@ -360,8 +361,13 @@ func validateSubSysConfig(s config.Config, subSys string, objAPI ObjectLayer) er
 			return err
 		}
 	case config.CallhomeSubSys:
-		if _, err := callhome.LookupConfig(s[config.CallhomeSubSys][config.Default]); err != nil {
+		cfg, err := callhome.LookupConfig(s[config.CallhomeSubSys][config.Default])
+		if err != nil {
 			return err
+		}
+		// callhome cannot be enabled if license is not registered yet, throw an error.
+		if cfg.Enabled() && !globalSubnetConfig.Registered() {
+			return errors.New("Deployment is not registered with SUBNET. Please register the deployment via 'mc license register ALIAS'")
 		}
 	case config.PolicyOPASubSys:
 		// In case legacy OPA config is being set, we treat it as if the
@@ -369,13 +375,12 @@ func validateSubSysConfig(s config.Config, subSys string, objAPI ObjectLayer) er
 		subSys = config.PolicyPluginSubSys
 		fallthrough
 	case config.PolicyPluginSubSys:
-		if ppargs, err := polplugin.LookupConfig(s[config.PolicyPluginSubSys][config.Default],
-			NewGatewayHTTPTransport(), xhttp.DrainBody); err != nil {
+		if ppargs, err := polplugin.LookupConfig(s, GetDefaultConnSettings(), xhttp.DrainBody); err != nil {
 			return err
 		} else if ppargs.URL == nil {
 			// Check if legacy opa is configured.
 			if _, err := opa.LookupConfig(s[config.PolicyOPASubSys][config.Default],
-				NewGatewayHTTPTransport(), xhttp.DrainBody); err != nil {
+				NewHTTPTransport(), xhttp.DrainBody); err != nil {
 				return err
 			}
 		}
@@ -388,14 +393,21 @@ func validateSubSysConfig(s config.Config, subSys string, objAPI ObjectLayer) er
 	}
 
 	if config.NotifySubSystems.Contains(subSys) {
-		if err := notify.TestSubSysNotificationTargets(GlobalContext, s, subSys, NewGatewayHTTPTransport()); err != nil {
+		if err := notify.TestSubSysNotificationTargets(ctx, s, subSys, NewHTTPTransport()); err != nil {
 			return err
 		}
 	}
+
+	if config.LambdaSubSystems.Contains(subSys) {
+		if err := lambda.TestSubSysLambdaTargets(GlobalContext, s, subSys, NewHTTPTransport()); err != nil {
+			return err
+		}
+	}
+
 	return nil
 }
 
-func validateConfig(s config.Config, subSys string) error {
+func validateConfig(ctx context.Context, s config.Config, subSys string) error {
 	objAPI := newObjectLayerFn()
 
 	// We must have a global lock for this so nobody else modifies env while we do.
@@ -407,12 +419,12 @@ func validateConfig(s config.Config, subSys string) error {
 	// Enable env values to validate KMS.
 	defer env.SetEnvOn()
 	if subSys != "" {
-		return validateSubSysConfig(s, subSys, objAPI)
+		return validateSubSysConfig(ctx, s, subSys, objAPI)
 	}
 
 	// No sub-system passed. Validate all of them.
 	for _, ss := range config.SubSystems.ToSlice() {
-		if err := validateSubSysConfig(s, ss, objAPI); err != nil {
+		if err := validateSubSysConfig(ctx, s, ss, objAPI); err != nil {
 			return err
 		}
 	}
@@ -423,53 +435,30 @@ func validateConfig(s config.Config, subSys string) error {
 func lookupConfigs(s config.Config, objAPI ObjectLayer) {
 	ctx := GlobalContext
 
-	var err error
-	if !globalActiveCred.IsValid() {
-		// Env doesn't seem to be set, we fallback to lookup creds from the config.
-		globalActiveCred, err = config.LookupCreds(s[config.CredentialsSubSys][config.Default])
-		if err != nil {
-			logger.LogIf(ctx, fmt.Errorf("Invalid credentials configuration: %w", err))
-		}
-	}
-
 	dnsURL, dnsUser, dnsPass, err := env.LookupEnv(config.EnvDNSWebhook)
 	if err != nil {
-		if globalIsGateway {
-			logger.FatalIf(err, "Unable to initialize remote webhook DNS config")
-		} else {
-			logger.LogIf(ctx, fmt.Errorf("Unable to initialize remote webhook DNS config %w", err))
-		}
+		logger.LogIf(ctx, fmt.Errorf("Unable to initialize remote webhook DNS config %w", err))
 	}
 	if err == nil && dnsURL != "" {
+		bootstrapTrace("initialize remote bucket DNS store")
 		globalDNSConfig, err = dns.NewOperatorDNS(dnsURL,
 			dns.Authentication(dnsUser, dnsPass),
 			dns.RootCAs(globalRootCAs))
 		if err != nil {
-			if globalIsGateway {
-				logger.FatalIf(err, "Unable to initialize remote webhook DNS config")
-			} else {
-				logger.LogIf(ctx, fmt.Errorf("Unable to initialize remote webhook DNS config %w", err))
-			}
+			logger.LogIf(ctx, fmt.Errorf("Unable to initialize remote webhook DNS config %w", err))
 		}
 	}
 
 	etcdCfg, err := etcd.LookupConfig(s[config.EtcdSubSys][config.Default], globalRootCAs)
 	if err != nil {
-		if globalIsGateway {
-			logger.FatalIf(err, "Unable to initialize etcd config")
-		} else {
-			logger.LogIf(ctx, fmt.Errorf("Unable to initialize etcd config: %w", err))
-		}
+		logger.LogIf(ctx, fmt.Errorf("Unable to initialize etcd config: %w", err))
 	}
 
 	if etcdCfg.Enabled {
+		bootstrapTrace("initialize etcd store")
 		globalEtcdClient, err = etcd.New(etcdCfg)
 		if err != nil {
-			if globalIsGateway {
-				logger.FatalIf(err, "Unable to initialize etcd config")
-			} else {
-				logger.LogIf(ctx, fmt.Errorf("Unable to initialize etcd config: %w", err))
-			}
+			logger.LogIf(ctx, fmt.Errorf("Unable to initialize etcd config: %w", err))
 		}
 
 		if len(globalDomainNames) != 0 && !globalDomainIPs.IsEmpty() && globalEtcdClient != nil {
@@ -485,12 +474,8 @@ func lookupConfigs(s config.Config, objAPI ObjectLayer) {
 					dns.CoreDNSPath(etcdCfg.CoreDNSPath),
 				)
 				if err != nil {
-					if globalIsGateway {
-						logger.FatalIf(err, "Unable to initialize DNS config")
-					} else {
-						logger.LogIf(ctx, fmt.Errorf("Unable to initialize DNS config for %s: %w",
-							globalDomainNames, err))
-					}
+					logger.LogIf(ctx, fmt.Errorf("Unable to initialize DNS config for %s: %w",
+						globalDomainNames, err))
 				}
 			}
 		}
@@ -510,11 +495,7 @@ func lookupConfigs(s config.Config, objAPI ObjectLayer) {
 
 	globalCacheConfig, err = cache.LookupConfig(s[config.CacheSubSys][config.Default])
 	if err != nil {
-		if globalIsGateway {
-			logger.FatalIf(err, "Unable to setup cache")
-		} else {
-			logger.LogIf(ctx, fmt.Errorf("Unable to setup cache: %w", err))
-		}
+		logger.LogIf(ctx, fmt.Errorf("Unable to setup cache: %w", err))
 	}
 
 	if globalCacheConfig.Enabled {
@@ -531,34 +512,24 @@ func lookupConfigs(s config.Config, objAPI ObjectLayer) {
 		logger.Fatal(errors.New("no KMS configured"), "MINIO_KMS_AUTO_ENCRYPTION requires a valid KMS configuration")
 	}
 
-	globalSTSTLSConfig, err = xtls.Lookup(s[config.IdentityTLSSubSys][config.Default])
-	if err != nil {
-		logger.LogIf(ctx, fmt.Errorf("Unable to initialize X.509/TLS STS API: %w", err))
-	}
+	transport := NewHTTPTransport()
 
-	if globalSTSTLSConfig.InsecureSkipVerify {
-		logger.LogIf(ctx, fmt.Errorf("CRITICAL: enabling %s is not recommended in a production environment", xtls.EnvIdentityTLSSkipVerify))
-	}
-
-	globalSubnetConfig, err = subnet.LookupConfig(s[config.SubnetSubSys][config.Default], globalProxyTransport)
-	if err != nil {
-		logger.LogIf(ctx, fmt.Errorf("Unable to parse subnet configuration: %w", err))
-	}
-
-	transport := NewGatewayHTTPTransport()
-
-	globalConfigTargetList, err = notify.FetchEnabledTargets(GlobalContext, s, transport)
+	bootstrapTrace("initialize the event notification targets")
+	globalNotifyTargetList, err = notify.FetchEnabledTargets(GlobalContext, s, transport)
 	if err != nil {
 		logger.LogIf(ctx, fmt.Errorf("Unable to initialize notification target(s): %w", err))
 	}
 
+	bootstrapTrace("initialize the lambda targets")
+	globalLambdaTargetList, err = lambda.FetchEnabledTargets(GlobalContext, s, transport)
+	if err != nil {
+		logger.LogIf(ctx, fmt.Errorf("Unable to initialize lambda target(s): %w", err))
+	}
+
+	bootstrapTrace("applying the dynamic configuration")
 	// Apply dynamic config values
 	if err := applyDynamicConfig(ctx, objAPI, s); err != nil {
-		if globalIsGateway {
-			logger.FatalIf(err, "Unable to initialize dynamic configuration")
-		} else {
-			logger.LogIf(ctx, err)
-		}
+		logger.LogIf(ctx, err)
 	}
 }
 
@@ -579,16 +550,12 @@ func applyDynamicConfigForSubSys(ctx context.Context, objAPI ObjectLayer, s conf
 
 		// Initialize remote instance transport once.
 		getRemoteInstanceTransportOnce.Do(func() {
-			getRemoteInstanceTransport = newGatewayHTTPTransport(apiConfig.RemoteTransportDeadline)
+			getRemoteInstanceTransport = NewHTTPTransportWithTimeout(apiConfig.RemoteTransportDeadline)
 		})
 	case config.CompressionSubSys:
 		cmpCfg, err := compress.LookupConfig(s[config.CompressionSubSys][config.Default])
 		if err != nil {
 			return fmt.Errorf("Unable to setup Compression: %w", err)
-		}
-		// Validate if the object layer supports compression.
-		if cmpCfg.Enabled && !objAPI.IsCompressionSupported() {
-			return fmt.Errorf("Backend does not support compression")
 		}
 		globalCompressConfigMu.Lock()
 		globalCompressConfig = cmpCfg
@@ -617,12 +584,12 @@ func applyDynamicConfigForSubSys(ctx context.Context, objAPI ObjectLayer, s conf
 			if l.Enabled {
 				l.LogOnce = logger.LogOnceConsoleIf
 				l.UserAgent = userAgent
-				l.Transport = NewGatewayHTTPTransportWithClientCerts(l.ClientCert, l.ClientKey)
-				loggerCfg.HTTP[n] = l
+				l.Transport = NewHTTPTransportWithClientCerts(l.ClientCert, l.ClientKey)
 			}
+			loggerCfg.HTTP[n] = l
 		}
-		if err = logger.UpdateSystemTargets(loggerCfg); err != nil {
-			logger.LogIf(ctx, fmt.Errorf("Unable to update logger webhook config: %w", err))
+		if errs := logger.UpdateSystemTargets(ctx, loggerCfg); len(errs) > 0 {
+			logger.LogIf(ctx, fmt.Errorf("Unable to update logger webhook config: %v", errs))
 		}
 	case config.AuditWebhookSubSys:
 		loggerCfg, err := logger.LookupConfigForSubSys(s, config.AuditWebhookSubSys)
@@ -634,13 +601,13 @@ func applyDynamicConfigForSubSys(ctx context.Context, objAPI ObjectLayer, s conf
 			if l.Enabled {
 				l.LogOnce = logger.LogOnceConsoleIf
 				l.UserAgent = userAgent
-				l.Transport = NewGatewayHTTPTransportWithClientCerts(l.ClientCert, l.ClientKey)
-				loggerCfg.AuditWebhook[n] = l
+				l.Transport = NewHTTPTransportWithClientCerts(l.ClientCert, l.ClientKey)
 			}
+			loggerCfg.AuditWebhook[n] = l
 		}
 
-		if err = logger.UpdateAuditWebhookTargets(loggerCfg); err != nil {
-			logger.LogIf(ctx, fmt.Errorf("Unable to update audit webhook targets: %w", err))
+		if errs := logger.UpdateAuditWebhookTargets(ctx, loggerCfg); len(errs) > 0 {
+			logger.LogIf(ctx, fmt.Errorf("Unable to update audit webhook targets: %v", errs))
 		}
 	case config.AuditKafkaSubSys:
 		loggerCfg, err := logger.LookupConfigForSubSys(s, config.AuditKafkaSubSys)
@@ -649,12 +616,15 @@ func applyDynamicConfigForSubSys(ctx context.Context, objAPI ObjectLayer, s conf
 		}
 		for n, l := range loggerCfg.AuditKafka {
 			if l.Enabled {
+				if l.TLS.Enable {
+					l.TLS.RootCAs = globalRootCAs
+				}
 				l.LogOnce = logger.LogOnceIf
 				loggerCfg.AuditKafka[n] = l
 			}
 		}
-		if err = logger.UpdateAuditKafkaTargets(loggerCfg); err != nil {
-			logger.LogIf(ctx, fmt.Errorf("Unable to update audit kafka targets: %w", err))
+		if errs := logger.UpdateAuditKafkaTargets(ctx, loggerCfg); len(errs) > 0 {
+			logger.LogIf(ctx, fmt.Errorf("Unable to update audit kafka targets: %v", errs))
 		}
 	case config.StorageClassSubSys:
 		for i, setDriveCount := range setDriveCounts {
@@ -669,13 +639,24 @@ func applyDynamicConfigForSubSys(ctx context.Context, objAPI ObjectLayer, s conf
 				globalStorageClass.Update(sc)
 			}
 		}
+	case config.SubnetSubSys:
+		subnetConfig, err := subnet.LookupConfig(s[config.SubnetSubSys][config.Default], globalProxyTransport)
+		if err != nil {
+			logger.LogIf(ctx, fmt.Errorf("Unable to parse subnet configuration: %w", err))
+		} else {
+			globalSubnetConfig.Update(subnetConfig)
+			globalSubnetConfig.ApplyEnv() // update environment settings for Console UI
+		}
 	case config.CallhomeSubSys:
 		callhomeCfg, err := callhome.LookupConfig(s[config.CallhomeSubSys][config.Default])
 		if err != nil {
 			logger.LogIf(ctx, fmt.Errorf("Unable to load callhome config: %w", err))
 		} else {
-			globalCallhomeConfig = callhomeCfg
-			updateCallhomeParams(ctx, objAPI)
+			enable := callhomeCfg.Enable && !globalCallhomeConfig.Enabled()
+			globalCallhomeConfig.Update(callhomeCfg)
+			if enable {
+				initCallhome(ctx, objAPI)
+			}
 		}
 	}
 	globalServerConfigMu.Lock()
@@ -739,37 +720,42 @@ func GetHelp(subSys, key string, envOnly bool) (Help, error) {
 		h = config.HelpKVS{value}
 	}
 
-	envHelp := config.HelpKVS{}
-	if envOnly {
-		// Only for multiple targets, make sure
-		// to list the ENV, for regular k/v EnableKey is
-		// implicit, for ENVs we cannot make it implicit.
-		if subSysHelp.MultipleTargets {
-			envK := config.EnvPrefix + strings.ToTitle(subSys) + config.EnvWordDelimiter + strings.ToTitle(madmin.EnableKey)
-			envHelp = append(envHelp, config.HelpKV{
-				Key:         envK,
-				Description: fmt.Sprintf("enable %s target, default is 'off'", subSys),
-				Optional:    false,
-				Type:        "on|off",
-			})
+	help := config.HelpKVS{}
+
+	// Only for multiple targets, make sure
+	// to list the ENV, for regular k/v EnableKey is
+	// implicit, for ENVs we cannot make it implicit.
+	if subSysHelp.MultipleTargets {
+		key := madmin.EnableKey
+		if envOnly {
+			key = config.EnvPrefix + strings.ToTitle(subSys) + config.EnvWordDelimiter + strings.ToTitle(madmin.EnableKey)
 		}
-		for _, hkv := range h {
-			envK := config.EnvPrefix + strings.ToTitle(subSys) + config.EnvWordDelimiter + strings.ToTitle(hkv.Key)
-			envHelp = append(envHelp, config.HelpKV{
-				Key:         envK,
-				Description: hkv.Description,
-				Optional:    hkv.Optional,
-				Type:        hkv.Type,
-			})
+		help = append(help, config.HelpKV{
+			Key:         key,
+			Description: fmt.Sprintf("enable %s target, default is 'off'", subSys),
+			Optional:    false,
+			Type:        "on|off",
+		})
+	}
+
+	for _, hkv := range h {
+		key := hkv.Key
+		if envOnly {
+			key = config.EnvPrefix + strings.ToTitle(subSys) + config.EnvWordDelimiter + strings.ToTitle(hkv.Key)
 		}
-		h = envHelp
+		help = append(help, config.HelpKV{
+			Key:         key,
+			Description: hkv.Description,
+			Optional:    hkv.Optional,
+			Type:        hkv.Type,
+		})
 	}
 
 	return Help{
 		SubSys:          subSys,
 		Description:     subSysHelp.Description,
 		MultipleTargets: subSysHelp.MultipleTargets,
-		KeysHelp:        h,
+		KeysHelp:        help,
 	}, nil
 }
 
@@ -783,13 +769,6 @@ func newSrvConfig(objAPI ObjectLayer) error {
 	// Initialize server config.
 	srvCfg := newServerConfig()
 
-	if globalActiveCred.IsValid() && !globalActiveCred.Equal(auth.DefaultCredentials) {
-		kvs := srvCfg[config.CredentialsSubSys][config.Default]
-		kvs.Set(config.AccessKey, globalActiveCred.AccessKey)
-		kvs.Set(config.SecretKey, globalActiveCred.SecretKey)
-		srvCfg[config.CredentialsSubSys][config.Default] = kvs
-	}
-
 	// hold the mutex lock before a new config is assigned.
 	globalServerConfigMu.Lock()
 	globalServerConfig = srvCfg
@@ -800,17 +779,20 @@ func newSrvConfig(objAPI ObjectLayer) error {
 }
 
 func getValidConfig(objAPI ObjectLayer) (config.Config, error) {
-	return readServerConfig(GlobalContext, objAPI)
+	return readServerConfig(GlobalContext, objAPI, nil)
 }
 
 // loadConfig - loads a new config from disk, overrides params
 // from env if found and valid
-func loadConfig(objAPI ObjectLayer) error {
-	srvCfg, err := getValidConfig(objAPI)
+// data is optional. If nil it will be loaded from backend.
+func loadConfig(objAPI ObjectLayer, data []byte) error {
+	bootstrapTrace("load the configuration")
+	srvCfg, err := readServerConfig(GlobalContext, objAPI, data)
 	if err != nil {
 		return err
 	}
 
+	bootstrapTrace("lookup the configuration")
 	// Override any values from ENVs.
 	lookupConfigs(srvCfg, objAPI)
 

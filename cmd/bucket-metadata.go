@@ -29,7 +29,7 @@ import (
 	"path"
 	"time"
 
-	"github.com/minio/madmin-go"
+	"github.com/minio/madmin-go/v3"
 	"github.com/minio/minio-go/v7/pkg/tags"
 	bucketsse "github.com/minio/minio/internal/bucket/encryption"
 	"github.com/minio/minio/internal/bucket/lifecycle"
@@ -88,6 +88,7 @@ type BucketMetadata struct {
 	QuotaConfigUpdatedAt        time.Time
 	ReplicationConfigUpdatedAt  time.Time
 	VersioningConfigUpdatedAt   time.Time
+	LifecycleConfigUpdatedAt    time.Time
 
 	// Unexported fields. Must be updated atomically.
 	policyConfig           *policy.Policy
@@ -119,6 +120,16 @@ func newBucketMetadata(name string) BucketMetadata {
 	}
 }
 
+// Versioning returns true if versioning is enabled
+func (b BucketMetadata) Versioning() bool {
+	return b.LockEnabled || (b.versioningConfig != nil && b.versioningConfig.Enabled()) || (b.objectLockConfig != nil && b.objectLockConfig.Enabled())
+}
+
+// ObjectLocking returns true if object locking is enabled
+func (b BucketMetadata) ObjectLocking() bool {
+	return b.LockEnabled || (b.objectLockConfig != nil && b.objectLockConfig.Enabled())
+}
+
 // SetCreatedAt preserves the CreatedAt time for bucket across sites in site replication. It defaults to
 // creation time of bucket on this cluster in all other cases.
 func (b *BucketMetadata) SetCreatedAt(createdAt time.Time) {
@@ -135,7 +146,7 @@ func (b *BucketMetadata) SetCreatedAt(createdAt time.Time) {
 func (b *BucketMetadata) Load(ctx context.Context, api ObjectLayer, name string) error {
 	if name == "" {
 		logger.LogIf(ctx, errors.New("bucket name cannot be empty"))
-		return errors.New("bucket name cannot be empty")
+		return errInvalidArgument
 	}
 	configFile := path.Join(bucketMetaPrefix, name, bucketMetadataFile)
 	data, err := readConfig(ctx, api, configFile)
@@ -323,8 +334,7 @@ func (b *BucketMetadata) getAllLegacyConfigs(ctx context.Context, objectAPI Obje
 
 		configData, err := readConfig(ctx, objectAPI, configFile)
 		if err != nil {
-			switch err.(type) {
-			case ObjectExistsAsDirectory:
+			if _, ok := err.(ObjectExistsAsDirectory); ok {
 				// in FS mode it possible that we have actual
 				// files in this folder with `.minio.sys/buckets/bucket/configFile`
 				continue
@@ -418,6 +428,10 @@ func (b *BucketMetadata) defaultTimestamps() {
 	if b.VersioningConfigUpdatedAt.IsZero() {
 		b.VersioningConfigUpdatedAt = b.Created
 	}
+
+	if b.LifecycleConfigUpdatedAt.IsZero() {
+		b.LifecycleConfigUpdatedAt = b.Created
+	}
 }
 
 // Save config to supplied ObjectLayer api.
@@ -440,23 +454,6 @@ func (b *BucketMetadata) Save(ctx context.Context, api ObjectLayer) error {
 
 	configFile := path.Join(bucketMetaPrefix, b.Name, bucketMetadataFile)
 	return saveConfig(ctx, api, configFile, data)
-}
-
-// deleteBucketMetadata deletes bucket metadata
-// If config does not exist no error is returned.
-func deleteBucketMetadata(ctx context.Context, obj objectDeleter, bucket string) error {
-	metadataFiles := []string{
-		dataUsageCacheName,
-		bucketMetadataFile,
-		path.Join(replicationDir, resyncFileName),
-	}
-	for _, metaFile := range metadataFiles {
-		configFile := path.Join(bucketMetaPrefix, bucket, metaFile)
-		if err := deleteConfig(ctx, obj, configFile); err != nil && err != errConfigNotFound {
-			return err
-		}
-	}
-	return nil
 }
 
 // migrate config for remote targets by encrypting data if currently unencrypted and kms is configured.
