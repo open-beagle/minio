@@ -7,7 +7,7 @@ git remote add upstream git@github.com:minio/minio.git
 
 git fetch upstream
 
-git merge RELEASE.2022-10-21T22-37-48Z
+git merge RELEASE.2023-07-11T21-29-34Z
 ```
 
 ## debug
@@ -18,7 +18,7 @@ docker run -it \
 --rm \
 -v $PWD/:/go/src/github.com/minio/minio \
 -w /go/src/github.com/minio/minio \
-registry.cn-qingdao.aliyuncs.com/wod/golang:1.19 \
+registry.cn-qingdao.aliyuncs.com/wod/golang:1.20 \
 rm -rf vendor && go mod vendor
 
 # build
@@ -26,7 +26,7 @@ docker run -it \
 --rm \
 -v $PWD/:/go/src/github.com/minio/minio \
 -w /go/src/github.com/minio/minio \
-registry.cn-qingdao.aliyuncs.com/wod/golang:1.19 \
+registry.cn-qingdao.aliyuncs.com/wod/golang:1.20 \
 bash .beagle/build.sh
 
 # check
