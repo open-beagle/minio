@@ -55,6 +55,7 @@ func getOpName(name string) (op string) {
 	op = strings.Replace(op, "(*peerRESTServer)", "peer", 1)
 	op = strings.Replace(op, "(*lockRESTServer)", "lockR", 1)
 	op = strings.Replace(op, "(*stsAPIHandlers)", "sts", 1)
+	op = strings.Replace(op, "(*peerS3Server)", "s3", 1)
 	op = strings.Replace(op, "ClusterCheckHandler", "health.Cluster", 1)
 	op = strings.Replace(op, "ClusterReadCheckHandler", "health.ClusterRead", 1)
 	op = strings.Replace(op, "LivenessCheckHandler", "health.Liveness", 1)
@@ -141,6 +142,7 @@ func httpTracerMiddleware(h http.Handler) http.Handler {
 			Time:      reqStartTime,
 			Duration:  reqEndTime.Sub(respRecorder.StartTime),
 			Path:      reqPath,
+			Bytes:     int64(inputBytes + respRecorder.Size()),
 			HTTP: &madmin.TraceHTTPStats{
 				ReqInfo: madmin.TraceRequestInfo{
 					Time:     reqStartTime,
@@ -162,7 +164,7 @@ func httpTracerMiddleware(h http.Handler) http.Handler {
 					Latency:         reqEndTime.Sub(respRecorder.StartTime),
 					InputBytes:      inputBytes,
 					OutputBytes:     respRecorder.Size(),
-					TimeToFirstByte: respRecorder.TimeToFirstByte,
+					TimeToFirstByte: respRecorder.TTFB(),
 				},
 			},
 		}

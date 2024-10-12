@@ -29,8 +29,12 @@ import (
 	"time"
 
 	"github.com/dustin/go-humanize"
+	"github.com/minio/minio-go/v7/pkg/s3utils"
 	"github.com/minio/minio-go/v7/pkg/set"
-	xnet "github.com/minio/pkg/net"
+	"github.com/minio/minio/internal/grid"
+	xnet "github.com/minio/pkg/v3/net"
+	"golang.org/x/exp/maps"
+	"golang.org/x/exp/slices"
 
 	"github.com/minio/minio/internal/amztime"
 	"github.com/minio/minio/internal/config/dns"
@@ -71,6 +75,9 @@ const (
 // and must not set by clients
 func containsReservedMetadata(header http.Header) bool {
 	for key := range header {
+		if slices.Contains(maps.Keys(validSSEReplicationHeaders), key) {
+			return false
+		}
 		if stringsHasPrefixFold(key, ReservedMetadataPrefix) {
 			return true
 		}
@@ -151,7 +158,7 @@ func setBrowserRedirectMiddleware(h http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		read := r.Method == http.MethodGet || r.Method == http.MethodHead
 		// Re-direction is handled specifically for browser requests.
-		if guessIsBrowserReq(r) && read {
+		if !guessIsHealthCheckReq(r) && guessIsBrowserReq(r) && read && globalBrowserRedirect {
 			// Fetch the redirect location if any.
 			if u := getRedirectLocation(r); u != nil {
 				// Employ a temporary re-direct.
@@ -206,7 +213,7 @@ func getRedirectLocation(r *http.Request) *xnet.URL {
 }
 
 // guessIsHealthCheckReq - returns true if incoming request looks
-// like healthcheck request
+// like healthCheck request
 func guessIsHealthCheckReq(req *http.Request) bool {
 	if req == nil {
 		return false
@@ -229,7 +236,10 @@ func guessIsMetricsReq(req *http.Request) bool {
 	return (aType == authTypeAnonymous || aType == authTypeJWT) &&
 		req.URL.Path == minioReservedBucketPath+prometheusMetricsPathLegacy ||
 		req.URL.Path == minioReservedBucketPath+prometheusMetricsV2ClusterPath ||
-		req.URL.Path == minioReservedBucketPath+prometheusMetricsV2NodePath
+		req.URL.Path == minioReservedBucketPath+prometheusMetricsV2NodePath ||
+		req.URL.Path == minioReservedBucketPath+prometheusMetricsV2BucketPath ||
+		req.URL.Path == minioReservedBucketPath+prometheusMetricsV2ResourcePath ||
+		strings.HasPrefix(req.URL.Path, minioReservedBucketPath+metricsV3Path)
 }
 
 // guessIsRPCReq - returns true if the request is for an RPC endpoint.
@@ -237,7 +247,14 @@ func guessIsRPCReq(req *http.Request) bool {
 	if req == nil {
 		return false
 	}
-	return req.Method == http.MethodPost &&
+	if req.Method == http.MethodGet && req.URL != nil {
+		switch req.URL.Path {
+		case grid.RoutePath, grid.RouteLockPath:
+			return true
+		}
+	}
+
+	return (req.Method == http.MethodPost || req.Method == http.MethodGet) &&
 		strings.HasPrefix(req.URL.Path, minioReservedBucketPath+SlashSeparator)
 }
 
@@ -255,7 +272,7 @@ func isKMSReq(r *http.Request) bool {
 
 // Supported Amz date headers.
 var amzDateHeaders = []string{
-	// Do not chane this order, x-amz-date value should be
+	// Do not change this order, x-amz-date value should be
 	// validated first.
 	"x-amz-date",
 	"date",
@@ -296,6 +313,13 @@ func hasBadHost(host string) error {
 // Check if the incoming path has bad path components,
 // such as ".." and "."
 func hasBadPathComponent(path string) bool {
+	if len(path) > 4096 {
+		// path cannot be greater than Linux PATH_MAX
+		// this is to avoid a busy loop, that can happen
+		// if the caller sends path of following style
+		// a/a/a/a/a/a/a/a...
+		return true
+	}
 	path = filepath.ToSlash(strings.TrimSpace(path)) // For windows '\' must be converted to '/'
 	for _, p := range strings.Split(path, SlashSeparator) {
 		switch strings.TrimSpace(p) {
@@ -399,6 +423,17 @@ func setRequestValidityMiddleware(h http.Handler) http.Handler {
 				writeErrorResponse(r.Context(), w, errorCodes.ToAPIErr(ErrAllAccessDisabled), r.URL)
 				return
 			}
+		} else {
+			// Validate bucket names if it is not empty
+			if bucketName != "" && s3utils.CheckValidBucketNameStrict(bucketName) != nil {
+				if ok {
+					tc.FuncName = "handler.ValidRequest"
+					tc.ResponseRecorder.LogErrBody = true
+				}
+				defer logger.AuditLog(r.Context(), w, r, mustGetClaimsFromToken(r))
+				writeErrorResponse(r.Context(), w, errorCodes.ToAPIErr(ErrInvalidBucketName), r.URL)
+				return
+			}
 		}
 		// Deny SSE-C requests if not made over TLS
 		if !globalIsTLS && (crypto.SSEC.IsRequested(r.Header) || crypto.SSECopy.IsRequested(r.Header)) {
@@ -430,9 +465,14 @@ func setRequestValidityMiddleware(h http.Handler) http.Handler {
 // is obtained from centralized etcd configuration service.
 func setBucketForwardingMiddleware(h http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if origin := w.Header().Get("Access-Control-Allow-Origin"); origin == "null" {
+			// This is a workaround change to ensure that "Origin: null"
+			// incoming request to a response back as "*" instead of "null"
+			w.Header().Set("Access-Control-Allow-Origin", "*")
+		}
 		if globalDNSConfig == nil || !globalBucketFederation ||
 			guessIsHealthCheckReq(r) || guessIsMetricsReq(r) ||
-			guessIsRPCReq(r) || guessIsLoginSTSReq(r) || isAdminReq(r) {
+			guessIsRPCReq(r) || guessIsLoginSTSReq(r) || isAdminReq(r) || isKMSReq(r) {
 			h.ServeHTTP(w, r)
 			return
 		}
@@ -564,13 +604,6 @@ func setUploadForwardingMiddleware(h http.Handler) http.Handler {
 				h.ServeHTTP(w, r)
 				return
 			}
-			// forward request to peer handling this upload
-			if globalBucketTargetSys.isOffline(remote.EndpointURL) {
-				defer logger.AuditLog(r.Context(), w, r, mustGetClaimsFromToken(r))
-				writeErrorResponse(r.Context(), w, errorCodes.ToAPIErr(ErrReplicationRemoteConnectionError), r.URL)
-				return
-			}
-
 			r.URL.Scheme = remote.EndpointURL.Scheme
 			r.URL.Host = remote.EndpointURL.Host
 			// Make sure we remove any existing headers before

@@ -66,10 +66,12 @@ const (
 	scannerMetricYield
 	scannerMetricCleanAbandoned
 	scannerMetricApplyNonCurrent
+	scannerMetricHealAbandonedVersion
 
 	// START Trace metrics:
 	scannerMetricStartTrace
 	scannerMetricScanObject // Scan object. All operations included.
+	scannerMetricHealAbandonedObject
 
 	// END realtime metrics:
 	scannerMetricLastRealtime
@@ -142,14 +144,14 @@ func (p *scannerMetrics) incTime(s scannerMetric, d time.Duration) {
 // timeILM times an ILM action.
 // lifecycle.NoneAction is ignored.
 // Use for s < scannerMetricLastRealtime
-func (p *scannerMetrics) timeILM(a lifecycle.Action) func() {
+func (p *scannerMetrics) timeILM(a lifecycle.Action) func(versions uint64) {
 	if a == lifecycle.NoneAction || a >= lifecycle.ActionCount {
-		return func() {}
+		return func(_ uint64) {}
 	}
 	startTime := time.Now()
-	return func() {
+	return func(versions uint64) {
 		duration := time.Since(startTime)
-		atomic.AddUint64(&p.actions[a], 1)
+		atomic.AddUint64(&p.actions[a], versions)
 		p.actionsLatency[a].add(duration)
 	}
 }

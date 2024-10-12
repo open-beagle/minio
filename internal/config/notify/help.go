@@ -143,7 +143,7 @@ var (
 		},
 		config.HelpKV{
 			Key:         target.AmqpPublisherConfirms,
-			Description: "enable consumer acknowlegement and publisher confirms, use this along with queue_dir for guaranteed delivery of all events",
+			Description: "enable consumer acknowledgement and publisher confirms, use this along with queue_dir for guaranteed delivery of all events",
 			Optional:    true,
 			Type:        "on|off",
 		},
@@ -261,6 +261,30 @@ var (
 			Description: config.DefaultComment,
 			Optional:    true,
 			Type:        "sentence",
+		},
+		config.HelpKV{
+			Key:         target.KafkaCompressionCodec,
+			Description: "specify compression_codec of the Kafka cluster",
+			Optional:    true,
+			Type:        "none|snappy|gzip|lz4|zstd",
+		},
+		config.HelpKV{
+			Key:         target.KafkaCompressionLevel,
+			Description: "specify compression level of the Kafka cluster",
+			Optional:    true,
+			Type:        "number",
+		},
+		config.HelpKV{
+			Key:         target.KafkaBatchSize,
+			Description: "batch size of the events; used only when queue_dir is set",
+			Optional:    true,
+			Type:        "number",
+		},
+		config.HelpKV{
+			Key:         target.KafkaBatchCommitTimeout,
+			Description: "commit timeout set for the batch; used only when batch_size > 1",
+			Optional:    true,
+			Type:        "duration",
 		},
 	}
 
@@ -661,6 +685,12 @@ var (
 			Type:        "string",
 			Sensitive:   true,
 			Secret:      true,
+		},
+		config.HelpKV{
+			Key:         target.RedisUser,
+			Description: "Redis server user for the auth",
+			Optional:    true,
+			Type:        "string",
 		},
 		config.HelpKV{
 			Key:         target.RedisQueueDir,
