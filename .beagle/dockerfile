@@ -35,10 +35,7 @@ ARG TARGETARCH
 
 COPY .bin/${TARGETOS}/${TARGETARCH}/minio /usr/bin/minio
 
-RUN export GNUTLS_CPUID_OVERRIDE=0x1 && \
-    apt update -y && \
-    apt install -y curl ca-certificates uidmap util-linux && \
-    apt clean all && \
+RUN apk add --no-cache curl ca-certificates util-linux && \
     chmod +x /usr/bin/minio && \
     chmod +x /usr/bin/docker-entrypoint.sh
 
