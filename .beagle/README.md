@@ -7,7 +7,7 @@ git remote add upstream git@github.com:minio/minio.git
 
 git fetch upstream
 
-git merge RELEASE.2023-07-11T21-29-34Z
+git merge RELEASE.2024-10-02T17-50-41Z
 ```
 
 ## debug
@@ -15,19 +15,19 @@ git merge RELEASE.2023-07-11T21-29-34Z
 ```bash
 # cache
 docker run -it \
---rm \
--v $PWD/:/go/src/github.com/minio/minio \
--w /go/src/github.com/minio/minio \
-registry.cn-qingdao.aliyuncs.com/wod/golang:1.20 \
-rm -rf vendor && go mod vendor
+  --rm \
+  -v $PWD/:/go/src/github.com/minio/minio \
+  -w /go/src/github.com/minio/minio \
+  registry.cn-qingdao.aliyuncs.com/wod/golang:1.22-alpine \
+  rm -rf vendor && go mod vendor
 
 # build
 docker run -it \
---rm \
--v $PWD/:/go/src/github.com/minio/minio \
--w /go/src/github.com/minio/minio \
-registry.cn-qingdao.aliyuncs.com/wod/golang:1.20 \
-bash .beagle/build.sh
+  --rm \
+  -v $PWD/:/go/src/github.com/minio/minio \
+  -w /go/src/github.com/minio/minio \
+  registry.cn-qingdao.aliyuncs.com/wod/golang:1.22-alpine \
+  bash .beagle/build.sh
 
 # check
 file .bin/linux/arm64/minio
@@ -42,8 +42,9 @@ docker run --rm \
   -e PLUGIN_ENDPOINT=$PLUGIN_ENDPOINT \
   -e PLUGIN_ACCESS_KEY=$PLUGIN_ACCESS_KEY \
   -e PLUGIN_SECRET_KEY=$PLUGIN_SECRET_KEY \
-  -e PLUGIN_PATH="/cache/open-beagle/minio" \
-  -e PLUGIN_MOUNT="./.git,./vendor" \
+  -e DRONE_REPO_OWNER="open-beagle" \
+  -e DRONE_REPO_NAME="minio" \
+  -e PLUGIN_MOUNT="./.git" \
   -v $(pwd):$(pwd) \
   -w $(pwd) \
   registry.cn-qingdao.aliyuncs.com/wod/devops-s3-cache:1.0
@@ -54,7 +55,8 @@ docker run --rm \
   -e PLUGIN_ENDPOINT=$PLUGIN_ENDPOINT \
   -e PLUGIN_ACCESS_KEY=$PLUGIN_ACCESS_KEY \
   -e PLUGIN_SECRET_KEY=$PLUGIN_SECRET_KEY \
-  -e PLUGIN_PATH="/cache/open-beagle/minio" \
+  -e DRONE_REPO_OWNER="open-beagle" \
+  -e DRONE_REPO_NAME="minio" \
   -v $(pwd):$(pwd) \
   -w $(pwd) \
   registry.cn-qingdao.aliyuncs.com/wod/devops-s3-cache:1.0

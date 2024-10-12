@@ -1,18 +1,19 @@
 #!/bin/sh
 
-set -x
+git config --global --add safe.directory $PWD
 
-export GOARCH=amd64
-make build
-mkdir -p .bin/linux/$GOARCH
-mv minio .bin/linux/$GOARCH/minio
+set -ex
 
-export GOARCH=arm64
+export TARGETPLATFORM=linux/amd64
+xx-apk add perl
+xx-go --wrap
 make build
-mkdir -p .bin/linux/$GOARCH
-mv minio .bin/linux/$GOARCH/minio
+mkdir -p .bin/$TARGETPLATFORM
+mv minio .bin/$TARGETPLATFORM/minio
 
-export GOARCH=ppc64le
+export TARGETPLATFORM=linux/arm64
+xx-apk add perl
+xx-go --wrap
 make build
-mkdir -p .bin/linux/$GOARCH
-mv minio .bin/linux/$GOARCH/minio
+mkdir -p .bin/$TARGETPLATFORM
+mv minio .bin/$TARGETPLATFORM/minio
